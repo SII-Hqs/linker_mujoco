@@ -1,0 +1,46 @@
+# Colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SII / Codex / Agents (local tooling)
+.sii/
+.codex/
+.agents/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# MuJoCo compiled binary model (can be regenerated from xml)
+*.mjb
+
+# Pickle data files (large, regeneratable)
+*.pkl
+
+# Contact patch output (generated data)
+contact_patch_output/
+
+# Logs
+*.log

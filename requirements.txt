@@ -7,7 +7,7 @@ ipython
 PyYAML
 tqdm
 wandb
-pybullet
+# pybullet
 mediapipe
 pyqt5
 pyqtgraph

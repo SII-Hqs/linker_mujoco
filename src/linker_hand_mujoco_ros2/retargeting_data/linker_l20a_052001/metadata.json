@@ -1,0 +1,10 @@
+{
+  "session_name": "20260520_102140",
+  "port": "/dev/ttyUSB0",
+  "baud_rate": 115200,
+  "fps": 30.0,
+  "started_epoch_ms": 1779243743639,
+  "stopped_epoch_ms": 1779243774919,
+  "frame_count": 949,
+  "pressure_plot_points": 500
+}
