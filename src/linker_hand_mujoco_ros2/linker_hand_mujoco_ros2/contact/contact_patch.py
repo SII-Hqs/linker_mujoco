@@ -30,6 +30,7 @@ class ContactPatchCalculator:
         self.points = np.empty((0, 3), dtype=float)
         self.forces = np.empty((0, 3), dtype=float)
         self.lowest_point = None
+        self.contact_generalized_force = np.zeros(self.model.nv, dtype=float)
         self.index_contact_torque = np.zeros(4, dtype=float)
         self.last_update_time = 0.0
 
@@ -91,6 +92,10 @@ class ContactPatchCalculator:
         self.lowest_point = lowest_point
         self.points = points
         self.forces = self.distribute_contact_force(points, lowest_point, contact_force_g)
+        self.contact_generalized_force = self.compute_contact_generalized_force(
+            points,
+            self.forces,
+        )
         self.index_contact_torque = self.compute_index_contact_torque(points, self.forces)
         return True
 
@@ -115,7 +120,20 @@ class ContactPatchCalculator:
         if len(points) == 0 or len(forces) == 0:
             return np.zeros(4, dtype=float)
 
+        tau_total = self.compute_contact_generalized_force(points, forces)
+
+        torque = np.zeros(len(self.index_joint_names), dtype=float)
+        for i, dof_id in enumerate(self.index_dof_ids):
+            if 0 <= dof_id < len(tau_total):
+                torque[i] = tau_total[dof_id]
+        return torque
+
+    def compute_contact_generalized_force(self, points, forces):
+        """Map Cartesian contact forces at patch points to generalized forces."""
         tau_total = np.zeros(self.model.nv, dtype=float)
+        if len(points) == 0 or len(forces) == 0:
+            return tau_total
+
         jacp = np.zeros((3, self.model.nv), dtype=float)
         jacr = np.zeros((3, self.model.nv), dtype=float)
         for point, force in zip(points, forces):
@@ -123,9 +141,4 @@ class ContactPatchCalculator:
             jacr[:] = 0.0
             mujoco.mj_jac(self.model, self.data, jacp, jacr, point, self.body_id)
             tau_total += jacp.T @ force
-
-        torque = np.zeros(len(self.index_joint_names), dtype=float)
-        for i, dof_id in enumerate(self.index_dof_ids):
-            if 0 <= dof_id < len(tau_total):
-                torque[i] = tau_total[dof_id]
-        return torque
+        return tau_total

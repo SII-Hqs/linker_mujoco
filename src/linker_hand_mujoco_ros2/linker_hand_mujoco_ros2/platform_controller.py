@@ -19,6 +19,8 @@ class MovingPlatformController:
         stroke,
         period,
         initial_pos=None,
+        high_z_offset=0.0,
+        low_z_offset=0.0,
     ):
         self.model = model
         self.data = data
@@ -62,8 +64,8 @@ class MovingPlatformController:
                 raise ValueError("initial_pos must contain exactly 3 values")
 
         self.center_xy = self.initial_pos[:2]
-        self.high_z = float(self.initial_pos[2])
-        self.low_z = float(target_pos[2] + platform_half_z - stroke)
+        self.high_z = float(self.initial_pos[2]) - abs(float(high_z_offset))
+        self.low_z = float(target_pos[2] + platform_half_z - stroke) + abs(float(low_z_offset))
         self.period = max(float(period), 0.1)
         self._target_pos = None
         self._target_lock = threading.Lock()
