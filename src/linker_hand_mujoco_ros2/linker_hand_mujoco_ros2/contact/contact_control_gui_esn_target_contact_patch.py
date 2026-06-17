@@ -2,6 +2,7 @@
 """PyQt5 GUI for target q/qdot ESN control with injected contact-patch forces."""
 
 import argparse
+import pickle
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ import numpy as np
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -30,10 +32,7 @@ from PyQt5.QtWidgets import (
 )
 
 if __package__:
-    from ..mujoco_esn_controller_target_q_dq import (
-        ControlRateAdapter,
-        ESNTorqueController,
-    )
+    from ..mujoco_esn_controller_target_q_dq import ESNTorqueController
     from ..position_command_mapper import PositionCommandMapper
     from .contact_control_demo import default_finger_vec, load_finger_frame
     from .contact_control_demo_esn_target import default_esn_model_path
@@ -63,10 +62,7 @@ else:
     )
     from linker_hand_mujoco_ros2.contact.contact_patch import ContactPatchCalculator
     from linker_hand_mujoco_ros2.contact.contact_visualizer import ContactVisualizer
-    from linker_hand_mujoco_ros2.mujoco_esn_controller_target_q_dq import (
-        ControlRateAdapter,
-        ESNTorqueController,
-    )
+    from linker_hand_mujoco_ros2.mujoco_esn_controller_target_q_dq import ESNTorqueController
     from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
 
 
@@ -98,6 +94,65 @@ def _apply_contact_params(model, solref, solimp):
         model.geom_solimp[geom_id, : len(solimp)] = solimp
 
 
+def _load_index_target_trajectory(model, trajectory_pkl, trajectory_fps):
+    """Load index_joint1/2/3 target q/qdot arrays from an L20a joints pkl."""
+    trajectory_fps = float(trajectory_fps)
+    if trajectory_fps <= 0.0:
+        raise ValueError("trajectory_fps must be positive")
+
+    with Path(trajectory_pkl).open("rb") as file:
+        payload = pickle.load(file)
+
+    joint_data = np.asarray(payload["data"], dtype=float)
+    if joint_data.ndim != 2 or joint_data.shape[0] == 0:
+        raise ValueError("trajectory data must be a non-empty 2-D array")
+
+    target_joint_names = ["index_joint1", "index_joint2", "index_joint3"]
+    joint_names = payload.get("meta_data", {}).get("joint_names", [])
+    if all(name in joint_names for name in target_joint_names):
+        target_columns = [joint_names.index(name) for name in target_joint_names]
+    else:
+        if joint_data.shape[1] < 4:
+            raise ValueError("trajectory data must contain at least 4 joint columns")
+        target_columns = [1, 2, 3]
+
+    target_qpos = joint_data[:, target_columns].copy()
+    target_qpos = np.vstack([
+        clip_to_joint_ranges(model, target_joint_names, frame)
+        for frame in target_qpos
+    ])
+    target_qvel = np.zeros_like(target_qpos)
+    if len(target_qpos) > 1:
+        target_qvel[:-1] = np.diff(target_qpos, axis=0) * trajectory_fps
+    return target_qpos, target_qvel
+
+
+class SimulationStepControlAdapter:
+    """Expose the ESN controller with one torque update per MuJoCo step."""
+
+    def __init__(self, controller: ESNTorqueController, horizon: int = 1) -> None:
+        self.controller = controller
+        self.horizon = horizon
+        self.last_tau = np.zeros(3, dtype=float)
+
+    def reset(self) -> None:
+        """Reset the wrapped controller state."""
+        self.controller.reset()
+        self.last_tau = np.zeros(3, dtype=float)
+
+    def step(self, qpos, qvel, force_g, target_qpos, target_qvel) -> np.ndarray:
+        """Compute a fresh torque command for the current simulation step."""
+        self.last_tau = self.controller.step(
+            qpos,
+            qvel,
+            force_g,
+            target_qpos,
+            target_qvel,
+            horizon=self.horizon,
+        )
+        return self.last_tau.copy()
+
+
 @dataclass
 class ESNTargetContactPatchSimulation:
     """Target q/qdot ESN simulation with GUI-injected contact-patch force."""
@@ -106,7 +161,7 @@ class ESNTargetContactPatchSimulation:
     data: object
     contact_patch: ContactPatchCalculator
     contact_visualizer: ContactVisualizer
-    controller: ControlRateAdapter
+    controller: SimulationStepControlAdapter
     target_qpos: np.ndarray
     target_qvel: np.ndarray
     contact_force_g: float
@@ -118,9 +173,37 @@ class ESNTargetContactPatchSimulation:
     force_max_g: float = 100.0
     force_period_s: float = 4.0
     force_profile_start_time: float = 0.0
+    trajectory_qpos: np.ndarray | None = None
+    trajectory_qvel: np.ndarray | None = None
+    trajectory_fps: float = 30.0
+    trajectory_loop: bool = False
+    trajectory_frame: int = 0
+    trajectory_playing: bool = False
+    trajectory_start_time: float = 0.0
+
+    def __post_init__(self):
+        """Initialize optional trajectory playback state."""
+        if not self.trajectory_active:
+            return
+        self.trajectory_fps = float(self.trajectory_fps)
+        if self.trajectory_fps <= 0.0:
+            raise ValueError("trajectory_fps must be positive")
+        if self.trajectory_qpos.shape != self.trajectory_qvel.shape:
+            raise ValueError("trajectory qpos/qvel arrays must have matching shapes")
+        if self.trajectory_qpos.ndim != 2 or self.trajectory_qpos.shape[1] != 3:
+            raise ValueError("trajectory arrays must have shape (N, 3)")
+        self.trajectory_playing = True
+        self.trajectory_start_time = float(self.data.time)
+        self._apply_trajectory_frame(0)
+
+    @property
+    def trajectory_active(self):
+        """Return True when target trajectory playback is configured."""
+        return self.trajectory_qpos is not None and self.trajectory_qvel is not None
 
     def step(self):
         """Advance simulation and inject the patch force into MuJoCo dynamics."""
+        self.update_trajectory_target()
         contact_force_g = self.current_contact_force_g()
         self.contact_force_g = contact_force_g
         force_update = (
@@ -162,6 +245,68 @@ class ESNTargetContactPatchSimulation:
     def reset_esn(self):
         """Reset the target q/qdot ESN controller state."""
         self.controller.reset()
+
+    def _apply_trajectory_frame(self, frame):
+        """Set target q/qdot from one trajectory frame."""
+        if not self.trajectory_active:
+            return
+        frame = int(np.clip(frame, 0, len(self.trajectory_qpos) - 1))
+        self.trajectory_frame = frame
+        self.target_qpos[:] = self.trajectory_qpos[frame]
+        self.target_qvel[:] = self.trajectory_qvel[frame]
+
+    def update_trajectory_target(self):
+        """Advance trajectory target according to MuJoCo simulation time."""
+        if not self.trajectory_active:
+            return
+        if self.trajectory_playing:
+            elapsed = max(0.0, float(self.data.time) - self.trajectory_start_time)
+            raw_frame = int(elapsed * self.trajectory_fps)
+            frame_count = len(self.trajectory_qpos)
+            if self.trajectory_loop:
+                frame = raw_frame % frame_count
+            else:
+                frame = min(raw_frame, frame_count - 1)
+                if raw_frame >= frame_count - 1:
+                    self.trajectory_playing = False
+            self._apply_trajectory_frame(frame)
+
+    def set_trajectory_playing(self, playing):
+        """Pause or resume trajectory playback."""
+        if not self.trajectory_active:
+            return
+        self.update_trajectory_target()
+        playing = bool(playing)
+        if playing and not self.trajectory_playing:
+            self.trajectory_start_time = (
+                float(self.data.time) - self.trajectory_frame / self.trajectory_fps
+            )
+        self.trajectory_playing = playing
+
+    def toggle_trajectory_playing(self):
+        """Toggle trajectory playback and return the new playing state."""
+        self.set_trajectory_playing(not self.trajectory_playing)
+        return self.trajectory_playing
+
+    def reset_trajectory(self):
+        """Restart trajectory playback from frame 0."""
+        if not self.trajectory_active:
+            return
+        self.trajectory_start_time = float(self.data.time)
+        self.trajectory_playing = True
+        self._apply_trajectory_frame(0)
+
+    def trajectory_snapshot(self):
+        """Return a compact trajectory playback status dictionary."""
+        frame_count = 0 if not self.trajectory_active else len(self.trajectory_qpos)
+        return {
+            "active": self.trajectory_active,
+            "frame": self.trajectory_frame,
+            "frame_count": frame_count,
+            "playing": self.trajectory_playing,
+            "loop": self.trajectory_loop,
+            "fps": self.trajectory_fps,
+        }
 
     def set_force_profile(self, mode, min_g, max_g, period_s):
         """Set the contact-force generator parameters."""
@@ -234,6 +379,8 @@ class TargetContactPatchSimulationWorker:
     def set_target_state(self, target_qpos, target_qvel):
         """Set the runtime target q/qdot state."""
         with self.state_lock:
+            if self.simulation.trajectory_active:
+                return
             self.simulation.target_qpos[:] = target_qpos
             self.simulation.target_qvel[:] = target_qvel
 
@@ -247,9 +394,20 @@ class TargetContactPatchSimulationWorker:
         with self.state_lock:
             self.simulation.reset_esn()
 
+    def toggle_trajectory_playing(self):
+        """Pause or resume trajectory playback."""
+        with self.state_lock:
+            return self.simulation.toggle_trajectory_playing()
+
+    def reset_trajectory(self):
+        """Restart trajectory playback from the first frame."""
+        with self.state_lock:
+            self.simulation.reset_trajectory()
+
     def snapshot(self):
         """Return a compact copy of the current simulation status."""
         with self.state_lock:
+            self.simulation.update_trajectory_target()
             contact_force_g = float(self.simulation.contact_force_g)
             return {
                 "contact_force_g": contact_force_g,
@@ -260,6 +418,9 @@ class TargetContactPatchSimulationWorker:
                 "qfrc_norm": float(np.linalg.norm(self.simulation.data.qfrc_applied)),
                 "tracking_error": float(np.linalg.norm(self.simulation.tracking_error())),
                 "force_profile_mode": self.simulation.force_profile_mode,
+                "target_qpos": self.simulation.target_qpos.copy(),
+                "target_qvel": self.simulation.target_qvel.copy(),
+                "trajectory": self.simulation.trajectory_snapshot(),
             }
 
     def _step_once(self):
@@ -314,6 +475,7 @@ class ESNTargetContactPatchControlWindow(QMainWindow):
         self.contact_force_max_g = float(contact_force_max_g)
         self.target_qpos_inputs = []
         self.target_qvel_inputs = []
+        self.trajectory_active = self.worker.simulation.trajectory_active
 
         self.setWindowTitle("L20a ESN Target Contact-Patch Force Control")
         self.setMinimumWidth(540)
@@ -387,8 +549,17 @@ class ESNTargetContactPatchControlWindow(QMainWindow):
             spin_box.setDecimals(4)
             spin_box.setSingleStep(0.01)
             spin_box.setRange(0.0, 1.5)
+            if self.trajectory_active:
+                qpos_values = self.worker.simulation.trajectory_qpos[:, i]
+                spin_box.setRange(
+                    min(0.0, float(np.min(qpos_values))),
+                    max(1.5, float(np.max(qpos_values))),
+                )
             spin_box.setSuffix(" rad")
             spin_box.setValue(float(value))
+            if self.trajectory_active:
+                spin_box.setReadOnly(True)
+                spin_box.setButtonSymbols(QAbstractSpinBox.NoButtons)
             spin_box.valueChanged.connect(self.update_target_state)
             self.target_qpos_inputs.append(spin_box)
             target_layout.addRow(f"target_qpos[{i}]:", spin_box)
@@ -397,12 +568,40 @@ class ESNTargetContactPatchControlWindow(QMainWindow):
             spin_box.setDecimals(4)
             spin_box.setSingleStep(0.1)
             spin_box.setRange(-2.0, 2.0)
+            if self.trajectory_active:
+                qvel_values = self.worker.simulation.trajectory_qvel[:, i]
+                spin_box.setRange(
+                    min(-2.0, float(np.min(qvel_values))),
+                    max(2.0, float(np.max(qvel_values))),
+                )
             spin_box.setSuffix(" rad/s")
             spin_box.setValue(float(value))
+            if self.trajectory_active:
+                spin_box.setReadOnly(True)
+                spin_box.setButtonSymbols(QAbstractSpinBox.NoButtons)
             spin_box.valueChanged.connect(self.update_target_state)
             self.target_qvel_inputs.append(spin_box)
             target_layout.addRow(f"target_qvel[{i}]:", spin_box)
         root_layout.addWidget(target_group)
+
+        if self.trajectory_active:
+            trajectory_group = QGroupBox("Trajectory")
+            trajectory_layout = QFormLayout(trajectory_group)
+            self.trajectory_frame_label = QLabel("0 / 0")
+            self.trajectory_frame_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.trajectory_status_label = QLabel("Stopped")
+            self.trajectory_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            trajectory_button_layout = QHBoxLayout()
+            self.trajectory_pause_button = QPushButton("暂停")
+            self.trajectory_pause_button.clicked.connect(self.toggle_trajectory_playback)
+            trajectory_button_layout.addWidget(self.trajectory_pause_button)
+            self.trajectory_reset_button = QPushButton("重置")
+            self.trajectory_reset_button.clicked.connect(self.reset_trajectory_playback)
+            trajectory_button_layout.addWidget(self.trajectory_reset_button)
+            trajectory_layout.addRow("Frame:", self.trajectory_frame_label)
+            trajectory_layout.addRow("Status:", self.trajectory_status_label)
+            trajectory_layout.addRow("Controls:", trajectory_button_layout)
+            root_layout.addWidget(trajectory_group)
 
         esn_group = QGroupBox("ESN Controller")
         esn_layout = QFormLayout(esn_group)
@@ -468,6 +667,8 @@ class ESNTargetContactPatchControlWindow(QMainWindow):
 
     def update_target_state(self, *_args):
         """Update runtime target q/qdot values from the spin boxes."""
+        if self.trajectory_active:
+            return
         target_qpos = [spin_box.value() for spin_box in self.target_qpos_inputs]
         target_qvel = [spin_box.value() for spin_box in self.target_qvel_inputs]
         self.worker.set_target_state(target_qpos, target_qvel)
@@ -484,6 +685,27 @@ class ESNTargetContactPatchControlWindow(QMainWindow):
     def reset_esn(self, *_args):
         """Reset the ESN reservoir and filters."""
         self.worker.reset_esn()
+
+    def toggle_trajectory_playback(self, *_args):
+        """Pause or resume trajectory playback."""
+        self.worker.toggle_trajectory_playing()
+        self.refresh_status()
+
+    def reset_trajectory_playback(self, *_args):
+        """Restart trajectory playback from the first frame."""
+        self.worker.reset_trajectory()
+        self.refresh_status()
+
+    def _refresh_target_spin_boxes(self, target_qpos, target_qvel):
+        """Update target spin boxes without emitting GUI edit callbacks."""
+        for spin_box, value in zip(self.target_qpos_inputs, target_qpos):
+            spin_box.blockSignals(True)
+            spin_box.setValue(float(value))
+            spin_box.blockSignals(False)
+        for spin_box, value in zip(self.target_qvel_inputs, target_qvel):
+            spin_box.blockSignals(True)
+            spin_box.setValue(float(value))
+            spin_box.blockSignals(False)
 
     def refresh_status(self):
         """Refresh displayed contact-patch state and worker health."""
@@ -506,6 +728,27 @@ class ESNTargetContactPatchControlWindow(QMainWindow):
         )
         self.tracking_error_label.setText(f"{snapshot['tracking_error']:.5f} rad")
         self.qfrc_norm_label.setText(f"{snapshot['qfrc_norm']:.4f}")
+        if self.trajectory_active:
+            self._refresh_target_spin_boxes(
+                snapshot["target_qpos"],
+                snapshot["target_qvel"],
+            )
+            trajectory = snapshot["trajectory"]
+            frame_count = trajectory["frame_count"]
+            frame_text = "0 / 0"
+            if frame_count > 0:
+                frame_text = f"{trajectory['frame'] + 1} / {frame_count}"
+            if not trajectory["playing"]:
+                status_text = "Stopped"
+            elif trajectory["loop"]:
+                status_text = "Looping"
+            else:
+                status_text = "Playing"
+            self.trajectory_frame_label.setText(frame_text)
+            self.trajectory_status_label.setText(status_text)
+            self.trajectory_pause_button.setText(
+                "暂停" if trajectory["playing"] else "继续"
+            )
         self.reservoir_widget.update_from_esn()
 
     def closeEvent(self, event):
@@ -544,9 +787,8 @@ def build_esn_target_contact_patch_simulation(args):
         torque_rate_limit=args.torque_rate_limit,
         filter_cutoff_hz=args.filter_cutoff_hz,
     )
-    controller = ControlRateAdapter(
+    controller = SimulationStepControlAdapter(
         esn,
-        sim_dt=model.opt.timestep,
         horizon=args.horizon,
     )
 
@@ -583,23 +825,37 @@ def build_esn_target_contact_patch_simulation(args):
 
     target_qpos = np.asarray(args.target_qpos, dtype=float).reshape(3).copy()
     target_qvel = np.asarray(args.target_qvel, dtype=float).reshape(3).copy()
+    trajectory_qpos = None
+    trajectory_qvel = None
+    if args.trajectory_pkl is not None:
+        trajectory_qpos, trajectory_qvel = _load_index_target_trajectory(
+            model,
+            args.trajectory_pkl,
+            args.trajectory_fps,
+        )
+        target_qpos = trajectory_qpos[0].copy()
+        target_qvel = trajectory_qvel[0].copy()
 
     return ESNTargetContactPatchSimulation(
-        model,
-        data,
-        contact_patch,
-        contact_visualizer,
-        controller,
-        target_qpos,
-        target_qvel,
-        args.contact_force_g,
-        index_dof_ids,
-        index_actuator_ids,
-        None,
-        args.force_profile,
-        args.force_min_g,
-        args.force_max_g,
-        args.force_period,
+        model=model,
+        data=data,
+        contact_patch=contact_patch,
+        contact_visualizer=contact_visualizer,
+        controller=controller,
+        target_qpos=target_qpos,
+        target_qvel=target_qvel,
+        contact_force_g=args.contact_force_g,
+        index_dof_ids=index_dof_ids,
+        index_actuator_ids=index_actuator_ids,
+        last_contact_force_g=None,
+        force_profile_mode=args.force_profile,
+        force_min_g=args.force_min_g,
+        force_max_g=args.force_max_g,
+        force_period_s=args.force_period,
+        trajectory_qpos=trajectory_qpos,
+        trajectory_qvel=trajectory_qvel,
+        trajectory_fps=args.trajectory_fps,
+        trajectory_loop=args.trajectory_loop,
     )
 
 
@@ -632,6 +888,23 @@ def add_esn_target_contact_patch_arguments(parser):
     )
     parser.add_argument("--contact-force-g", type=float, default=0.0)
     parser.add_argument("--contact-force-max-g", type=float, default=1000.0)
+    parser.add_argument(
+        "--trajectory-pkl",
+        type=Path,
+        default=None,
+        help="Optional L20a *_joints.pkl target trajectory to replay.",
+    )
+    parser.add_argument(
+        "--trajectory-fps",
+        type=float,
+        default=30.0,
+        help="Target trajectory playback frame rate in frames per second.",
+    )
+    parser.add_argument(
+        "--trajectory-loop",
+        action="store_true",
+        help="Loop the target trajectory instead of stopping at the last frame.",
+    )
     parser.add_argument(
         "--force-profile",
         choices=["Manual", "Sine", "Triangle", "Square", "Ramp"],

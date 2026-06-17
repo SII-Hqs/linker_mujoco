@@ -39,12 +39,19 @@ python -m linker_hand_mujoco_ros2.contact.contact_control_demo_esn \  --solref 0
 
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_demo_esn_visualized.py  --high-z-offset 0.02 --low-z-offset 0.01 --solref 0.02 1.0
 
+* 接触力已缩放
+
 * 控制平台运动+esn可视化
-python -m linker_hand_mujoco_ros2.contact.contact_control_gui_esn
+python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn.py
 
 * 控制平台运动+esn可视化+目标位置
-* conda activate linker_mujoco
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target.py --solref 0.02 1.0 --target-qpos 0.332 0.254 0.271
 
-* esn可视化+目标位置+注入力
+* 控制平台运动+esn可视化+目标轨迹
+python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target.py \
+  --solref 0.02 1.0 \
+  --trajectory-pkl src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/trajectory_1781583721.pkl \
+  --trajectory-fps 30
+
+* esn可视化+目标位置+注入力（感觉这样不太好，台抽象了）
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target_contact_patch.py --solref 0.02 1.0 --target-qpos 0.332 0.254 0.271

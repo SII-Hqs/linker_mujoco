@@ -64,8 +64,8 @@ class MovingPlatformController:
                 raise ValueError("initial_pos must contain exactly 3 values")
 
         self.center_xy = self.initial_pos[:2]
-        self.high_z = float(self.initial_pos[2]) - abs(float(high_z_offset))
-        self.low_z = float(target_pos[2] + platform_half_z - stroke) + abs(float(low_z_offset))
+        self.high_z = float(self.initial_pos[2]) + float(high_z_offset)
+        self.low_z = float(target_pos[2] + platform_half_z - stroke) + float(low_z_offset)
         self.period = max(float(period), 0.1)
         self._target_pos = None
         self._target_lock = threading.Lock()

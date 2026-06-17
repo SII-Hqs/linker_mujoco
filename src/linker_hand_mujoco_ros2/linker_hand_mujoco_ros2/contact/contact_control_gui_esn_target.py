@@ -2,13 +2,16 @@
 """Interactive PyQt5 GUI for the target q/qdot ESN contact demo."""
 
 import argparse
+import pickle
 import sys
 from pathlib import Path
 
 import numpy as np
+import pyqtgraph as pg
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -42,10 +45,271 @@ else:
     )
 
 
+def _load_target_trajectory(trajectory_pkl, trajectory_fps):
+    """Load target q/qdot arrays ordered as index_joint1/2/3."""
+    trajectory_fps = float(trajectory_fps)
+    if trajectory_fps <= 0.0:
+        raise ValueError("trajectory_fps must be positive")
+
+    with Path(trajectory_pkl).open("rb") as file:
+        payload = pickle.load(file)
+
+    if isinstance(payload, dict) and "qpos" in payload:
+        target_qpos = np.asarray(payload["qpos"], dtype=float)
+        if "qvel" in payload:
+            target_qvel = np.asarray(payload["qvel"], dtype=float)
+        else:
+            target_qvel = np.zeros_like(target_qpos)
+            if len(target_qpos) > 1:
+                target_qvel[:-1] = np.diff(target_qpos, axis=0) * trajectory_fps
+    elif isinstance(payload, dict) and "data" in payload:
+        joint_data = np.asarray(payload["data"], dtype=float)
+        target_joint_names = ["index_joint1", "index_joint2", "index_joint3"]
+        joint_names = payload.get("meta_data", {}).get("joint_names", [])
+        if all(name in joint_names for name in target_joint_names):
+            target_columns = [joint_names.index(name) for name in target_joint_names]
+        else:
+            if joint_data.ndim != 2 or joint_data.shape[1] < 4:
+                raise ValueError("trajectory data must contain at least 4 joint columns")
+            target_columns = [1, 2, 3]
+        target_qpos = joint_data[:, target_columns].copy()
+        target_qvel = np.zeros_like(target_qpos)
+        if len(target_qpos) > 1:
+            target_qvel[:-1] = np.diff(target_qpos, axis=0) * trajectory_fps
+    else:
+        target_qpos = np.asarray(payload, dtype=float)
+        target_qvel = np.zeros_like(target_qpos)
+        if len(target_qpos) > 1:
+            target_qvel[:-1] = np.diff(target_qpos, axis=0) * trajectory_fps
+
+    if target_qpos.ndim != 2 or target_qpos.shape[1] != 3:
+        raise ValueError("trajectory qpos must have shape (N, 3)")
+    if target_qvel.shape != target_qpos.shape:
+        raise ValueError("trajectory qvel must have the same shape as qpos")
+    if target_qpos.shape[0] == 0:
+        raise ValueError("trajectory must contain at least one frame")
+    return target_qpos.copy(), target_qvel.copy()
+
+
+class TargetTrajectoryPlayer:
+    """Advance simulation target q/qdot ordered as index_joint1/2/3."""
+
+    def __init__(self, simulation, target_qpos, target_qvel, fps, loop=False):
+        self.simulation = simulation
+        self.target_qpos = np.asarray(target_qpos, dtype=float)
+        self.target_qvel = np.asarray(target_qvel, dtype=float)
+        self.fps = float(fps)
+        self.loop = bool(loop)
+        self.feature_offset = int(
+            simulation.controller.controller.target_state_offset
+        )
+        self.frame = 0
+        self.feature_frame = 0
+        self.playing = True
+        self.start_time = float(simulation.data.time)
+        self.apply_frame(0)
+
+    @property
+    def active(self):
+        """Return True while a trajectory is configured."""
+        return True
+
+    def _resolve_frame(self, frame):
+        """Return a valid trajectory frame using loop/clamp semantics."""
+        frame = int(frame)
+        frame_count = len(self.target_qpos)
+        if self.loop:
+            return frame % frame_count
+        return int(np.clip(frame, 0, frame_count - 1))
+
+    def apply_frame(self, frame):
+        """Apply future target features while retaining current tracking target."""
+        frame = self._resolve_frame(frame)
+        feature_frame = self._resolve_frame(frame + self.feature_offset)
+        self.frame = frame
+        self.feature_frame = feature_frame
+        self.simulation.target_qpos[:] = self.target_qpos[feature_frame]
+        self.simulation.target_qvel[:] = self.target_qvel[feature_frame]
+
+    def update(self):
+        """Advance target according to MuJoCo simulation time."""
+        if not self.playing:
+            return
+        elapsed = max(0.0, float(self.simulation.data.time) - self.start_time)
+        raw_frame = int(elapsed * self.fps)
+        frame_count = len(self.target_qpos)
+        if self.loop:
+            frame = raw_frame % frame_count
+        else:
+            frame = min(raw_frame, frame_count - 1)
+            if raw_frame >= frame_count - 1:
+                self.playing = False
+        self.apply_frame(frame)
+
+    def toggle_playing(self):
+        """Pause or resume trajectory playback."""
+        self.update()
+        if not self.playing:
+            self.start_time = float(self.simulation.data.time) - self.frame / self.fps
+        self.playing = not self.playing
+        return self.playing
+
+    def reset(self):
+        """Restart trajectory playback from frame 0."""
+        self.start_time = float(self.simulation.data.time)
+        self.playing = True
+        self.apply_frame(0)
+
+    def snapshot(self):
+        """Return compact playback status."""
+        return {
+            "frame": self.frame,
+            "feature_frame": self.feature_frame,
+            "frame_count": len(self.target_qpos),
+            "playing": self.playing,
+            "loop": self.loop,
+            "feature_offset": self.feature_offset,
+            "tracking_qpos": self.target_qpos[self.frame].copy(),
+            "tracking_qvel": self.target_qvel[self.frame].copy(),
+            "feature_qpos": self.target_qpos[self.feature_frame].copy(),
+            "feature_qvel": self.target_qvel[self.feature_frame].copy(),
+        }
+
+
+class TrajectorySimulationWorker(SimulationWorker):
+    """Simulation worker that updates target trajectory before each step."""
+
+    def __init__(self, simulation, trajectory_player=None, launch_viewer=True):
+        super().__init__(simulation, launch_viewer=launch_viewer)
+        self.trajectory_player = trajectory_player
+
+    @property
+    def trajectory_active(self):
+        """Return True when target trajectory playback is configured."""
+        return self.trajectory_player is not None
+
+    def _step_once(self):
+        if self.trajectory_player is not None:
+            self.trajectory_player.update()
+        super()._step_once()
+
+    def toggle_trajectory_playing(self):
+        """Pause or resume trajectory playback."""
+        if self.trajectory_player is None:
+            return False
+        return self.trajectory_player.toggle_playing()
+
+    def reset_trajectory(self):
+        """Restart trajectory playback from the first frame."""
+        if self.trajectory_player is not None:
+            self.trajectory_player.reset()
+
+    def trajectory_snapshot(self):
+        """Return target trajectory playback status."""
+        if self.trajectory_player is None:
+            return {
+                "frame": 0,
+                "feature_frame": 0,
+                "frame_count": 0,
+                "playing": False,
+                "loop": False,
+                "feature_offset": 0,
+                "tracking_qpos": self.simulation.target_qpos.copy(),
+                "tracking_qvel": self.simulation.target_qvel.copy(),
+                "feature_qpos": self.simulation.target_qpos.copy(),
+                "feature_qvel": self.simulation.target_qvel.copy(),
+            }
+        self.trajectory_player.update()
+        return self.trajectory_player.snapshot()
+
+
+class TrajectoryTrackingPlotWidget(QWidget):
+    """Real-time target-vs-actual qpos tracking plots."""
+
+    def __init__(self, joint_names, window_s=8.0):
+        super().__init__()
+        self.joint_names = list(joint_names)
+        self.window_s = max(float(window_s), 0.5)
+        self.times = []
+        self.target_qpos = []
+        self.actual_qpos = []
+        self.error_norm = []
+
+        pg.setConfigOptions(antialias=True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_widget = pg.GraphicsLayoutWidget()
+        self.plot_widget.setMinimumHeight(420)
+        layout.addWidget(self.plot_widget)
+
+        target_pen = pg.mkPen(color=(214, 84, 84), width=2, style=Qt.DashLine)
+        actual_pen = pg.mkPen(color=(52, 126, 204), width=2)
+        error_pen = pg.mkPen(color=(50, 150, 90), width=2)
+        self.target_curves = []
+        self.actual_curves = []
+        for row, joint_name in enumerate(self.joint_names):
+            plot = self.plot_widget.addPlot(row=row, col=0)
+            plot.setLabel("left", f"{joint_name}", units="rad")
+            if row == len(self.joint_names) - 1:
+                plot.setLabel("bottom", "time", units="s")
+            plot.showGrid(x=True, y=True, alpha=0.25)
+            plot.addLegend(offset=(5, 5))
+            target_curve = plot.plot(name="target", pen=target_pen)
+            actual_curve = plot.plot(name="actual", pen=actual_pen)
+            self.target_curves.append(target_curve)
+            self.actual_curves.append(actual_curve)
+
+        self.error_plot = self.plot_widget.addPlot(row=len(self.joint_names), col=0)
+        self.error_plot.setLabel("left", "error norm", units="rad")
+        self.error_plot.setLabel("bottom", "time", units="s")
+        self.error_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.error_curve = self.error_plot.plot(name="error", pen=error_pen)
+
+    def sample(self, sim_time, target_qpos, actual_qpos):
+        """Append one tracking sample and redraw the rolling window."""
+        target_qpos = np.asarray(target_qpos, dtype=float).reshape(3)
+        actual_qpos = np.asarray(actual_qpos, dtype=float).reshape(3)
+        sim_time = float(sim_time)
+        self.times.append(sim_time)
+        self.target_qpos.append(target_qpos.copy())
+        self.actual_qpos.append(actual_qpos.copy())
+        self.error_norm.append(float(np.linalg.norm(actual_qpos - target_qpos)))
+
+        cutoff = sim_time - self.window_s
+        while self.times and self.times[0] < cutoff:
+            self.times.pop(0)
+            self.target_qpos.pop(0)
+            self.actual_qpos.pop(0)
+            self.error_norm.pop(0)
+
+        times = np.asarray(self.times, dtype=float)
+        target = np.asarray(self.target_qpos, dtype=float)
+        actual = np.asarray(self.actual_qpos, dtype=float)
+        for i in range(3):
+            self.target_curves[i].setData(times, target[:, i])
+            self.actual_curves[i].setData(times, actual[:, i])
+        self.error_curve.setData(times, np.asarray(self.error_norm, dtype=float))
+
+
+class TrajectoryTrackingWindow(QMainWindow):
+    """Independent window for real-time target-vs-actual tracking curves."""
+
+    def __init__(self, joint_names, window_s=8.0):
+        super().__init__()
+        self.setWindowTitle("L20a ESN Target Tracking")
+        self.resize(900, 760)
+        self.plot_widget = TrajectoryTrackingPlotWidget(joint_names, window_s=window_s)
+        self.setCentralWidget(self.plot_widget)
+
+    def sample(self, sim_time, target_qpos, actual_qpos):
+        """Append one sample to the plot widget."""
+        self.plot_widget.sample(sim_time, target_qpos, actual_qpos)
+
+
 class ESNTargetContactControlWindow(QMainWindow):
     """GUI for target q/qdot ESN platform control and monitoring."""
 
-    def __init__(self, worker, position_range, refresh_ms):
+    def __init__(self, worker, position_range, refresh_ms, plot_window):
         super().__init__()
         self.worker = worker
         self.initial_pos = self.worker.simulation.platform.initial_pos.copy()
@@ -53,6 +317,13 @@ class ESNTargetContactControlWindow(QMainWindow):
         self.position_inputs = {}
         self.target_qpos_inputs = []
         self.target_qvel_inputs = []
+        self.target_joint_names = ["index_joint1", "index_joint2", "index_joint3"]
+        self.plot_window = float(plot_window)
+        self.trajectory_active = self.worker.trajectory_active
+        self.tracking_window = TrajectoryTrackingWindow(
+            self.target_joint_names,
+            window_s=self.plot_window,
+        )
 
         self.setWindowTitle("L20a ESN Target-Tracking Contact Platform Control")
         self.setMinimumWidth(520)
@@ -89,29 +360,83 @@ class ESNTargetContactControlWindow(QMainWindow):
             position_layout.addRow(f"{axis}:", spin_box)
         root_layout.addWidget(position_group)
 
-        target_group = QGroupBox("Target Joint State")
+        target_group_title = "Target Joint State"
+        if self.trajectory_active:
+            target_group_title = "ESN Future Target Feature"
+        target_group = QGroupBox(target_group_title)
         target_layout = QFormLayout(target_group)
         for i, value in enumerate(self.worker.simulation.target_qpos):
             spin_box = QDoubleSpinBox()
             spin_box.setDecimals(4)
             spin_box.setSingleStep(0.01)
             spin_box.setRange(0.0, 1.5)
+            if self.trajectory_active:
+                qpos_values = self.worker.trajectory_player.target_qpos[:, i]
+                spin_box.setRange(
+                    min(0.0, float(np.min(qpos_values))),
+                    max(1.5, float(np.max(qpos_values))),
+                )
             spin_box.setSuffix(" rad")
             spin_box.setValue(float(value))
+            if self.trajectory_active:
+                spin_box.setReadOnly(True)
+                spin_box.setButtonSymbols(QAbstractSpinBox.NoButtons)
             spin_box.valueChanged.connect(self.update_target_state)
             self.target_qpos_inputs.append(spin_box)
-            target_layout.addRow(f"target_qpos[{i}]:", spin_box)
+            qpos_label = f"{self.target_joint_names[i]} qpos:"
+            if self.trajectory_active:
+                qpos_label = f"{self.target_joint_names[i]} feature qpos:"
+            target_layout.addRow(qpos_label, spin_box)
         for i, value in enumerate(self.worker.simulation.target_qvel):
             spin_box = QDoubleSpinBox()
             spin_box.setDecimals(4)
             spin_box.setSingleStep(0.1)
             spin_box.setRange(-2.0, 2.0)
+            if self.trajectory_active:
+                qvel_values = self.worker.trajectory_player.target_qvel[:, i]
+                spin_box.setRange(
+                    min(-2.0, float(np.min(qvel_values))),
+                    max(2.0, float(np.max(qvel_values))),
+                )
             spin_box.setSuffix(" rad/s")
             spin_box.setValue(float(value))
+            if self.trajectory_active:
+                spin_box.setReadOnly(True)
+                spin_box.setButtonSymbols(QAbstractSpinBox.NoButtons)
             spin_box.valueChanged.connect(self.update_target_state)
             self.target_qvel_inputs.append(spin_box)
-            target_layout.addRow(f"target_qvel[{i}]:", spin_box)
+            qvel_label = f"{self.target_joint_names[i]} qvel:"
+            if self.trajectory_active:
+                qvel_label = f"{self.target_joint_names[i]} feature qvel:"
+            target_layout.addRow(qvel_label, spin_box)
         root_layout.addWidget(target_group)
+
+        if self.trajectory_active:
+            trajectory_group = QGroupBox("Trajectory")
+            trajectory_layout = QFormLayout(trajectory_group)
+            self.trajectory_frame_label = QLabel("0 / 0")
+            self.trajectory_frame_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.trajectory_feature_frame_label = QLabel("0 / 0")
+            self.trajectory_feature_frame_label.setAlignment(
+                Qt.AlignRight | Qt.AlignVCenter
+            )
+            self.trajectory_status_label = QLabel("Stopped")
+            self.trajectory_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            trajectory_button_layout = QHBoxLayout()
+            self.trajectory_pause_button = QPushButton("暂停")
+            self.trajectory_pause_button.clicked.connect(self.toggle_trajectory_playback)
+            trajectory_button_layout.addWidget(self.trajectory_pause_button)
+            self.trajectory_reset_button = QPushButton("重置")
+            self.trajectory_reset_button.clicked.connect(self.reset_trajectory_playback)
+            trajectory_button_layout.addWidget(self.trajectory_reset_button)
+            trajectory_layout.addRow("Frame:", self.trajectory_frame_label)
+            trajectory_layout.addRow(
+                "ESN feature frame:",
+                self.trajectory_feature_frame_label,
+            )
+            trajectory_layout.addRow("Status:", self.trajectory_status_label)
+            trajectory_layout.addRow("Controls:", trajectory_button_layout)
+            root_layout.addWidget(trajectory_group)
 
         esn_group = QGroupBox("ESN Controller")
         esn_layout = QFormLayout(esn_group)
@@ -172,6 +497,8 @@ class ESNTargetContactControlWindow(QMainWindow):
 
     def update_target_state(self, *_args):
         """Update runtime target q/qdot values from the spin boxes."""
+        if self.trajectory_active:
+            return
         self.worker.simulation.target_qpos[:] = [
             spin_box.value() for spin_box in self.target_qpos_inputs
         ]
@@ -196,6 +523,33 @@ class ESNTargetContactControlWindow(QMainWindow):
         """Reset the ESN reservoir and filters."""
         self.worker.simulation.controller.reset()
 
+    def toggle_trajectory_playback(self, *_args):
+        """Pause or resume trajectory playback."""
+        self.worker.toggle_trajectory_playing()
+        self.refresh_status()
+
+    def reset_trajectory_playback(self, *_args):
+        """Restart trajectory playback from the first frame."""
+        self.worker.reset_trajectory()
+        self.refresh_status()
+
+    def _refresh_target_spin_boxes(self):
+        """Update target spin boxes from simulation without emitting callbacks."""
+        for spin_box, value in zip(
+            self.target_qpos_inputs,
+            self.worker.simulation.target_qpos,
+        ):
+            spin_box.blockSignals(True)
+            spin_box.setValue(float(value))
+            spin_box.blockSignals(False)
+        for spin_box, value in zip(
+            self.target_qvel_inputs,
+            self.worker.simulation.target_qvel,
+        ):
+            spin_box.blockSignals(True)
+            spin_box.setValue(float(value))
+            spin_box.blockSignals(False)
+
     def refresh_status(self):
         """Refresh displayed contact state and worker health."""
         if self.worker.error is not None:
@@ -209,14 +563,50 @@ class ESNTargetContactControlWindow(QMainWindow):
         self.raw_force_label.setText(f"{state.raw_normal_force:.4f} N")
         tau = self.worker.simulation.controller.last_tau
         self.tau_label.setText(", ".join(f"{t:.4f}" for t in tau))
-        error = np.linalg.norm(self.worker.simulation.tracking_error())
+        actual_qpos = self.worker.simulation.current_qpos()
+        target_qpos = self.worker.simulation.target_qpos.copy()
+        tracking_qpos = target_qpos
+        trajectory = None
+        if self.trajectory_active:
+            trajectory = self.worker.trajectory_snapshot()
+            tracking_qpos = trajectory["tracking_qpos"]
+        error = np.linalg.norm(actual_qpos - tracking_qpos)
         self.tracking_error_label.setText(f"{error:.5f} rad")
         self.geom_label.setText(", ".join(state.geoms) if state.geoms else "none")
+        self.tracking_window.sample(
+            self.worker.simulation.data.time,
+            tracking_qpos,
+            actual_qpos,
+        )
+        if self.trajectory_active:
+            self._refresh_target_spin_boxes()
+            frame_count = trajectory["frame_count"]
+            frame_text = "0 / 0"
+            feature_frame_text = "0 / 0"
+            if frame_count > 0:
+                frame_text = f"{trajectory['frame'] + 1} / {frame_count}"
+                feature_frame_text = (
+                    f"{trajectory['feature_frame'] + 1} / {frame_count} "
+                    f"(+{trajectory['feature_offset']})"
+                )
+            if not trajectory["playing"]:
+                status_text = "Stopped"
+            elif trajectory["loop"]:
+                status_text = "Looping"
+            else:
+                status_text = "Playing"
+            self.trajectory_frame_label.setText(frame_text)
+            self.trajectory_feature_frame_label.setText(feature_frame_text)
+            self.trajectory_status_label.setText(status_text)
+            self.trajectory_pause_button.setText(
+                "暂停" if trajectory["playing"] else "继续"
+            )
         self.reservoir_widget.update_from_esn()
 
     def closeEvent(self, event):
         """Stop the simulation thread when the GUI closes."""
         self.refresh_timer.stop()
+        self.tracking_window.close()
         self.worker.stop()
         event.accept()
 
@@ -235,6 +625,29 @@ def parse_args(argv):
     )
     parser.add_argument("--refresh-ms", type=int, default=100)
     parser.add_argument(
+        "--trajectory-pkl",
+        type=Path,
+        default=None,
+        help="Optional target q/qdot trajectory pkl to replay.",
+    )
+    parser.add_argument(
+        "--trajectory-fps",
+        type=float,
+        default=30.0,
+        help="Target trajectory playback frame rate in frames per second.",
+    )
+    parser.add_argument(
+        "--trajectory-loop",
+        action="store_true",
+        help="Loop the target trajectory instead of stopping at the last frame.",
+    )
+    parser.add_argument(
+        "--plot-window",
+        type=float,
+        default=8.0,
+        help="Rolling time window in seconds for target-vs-actual qpos plots.",
+    )
+    parser.add_argument(
         "--no-viewer",
         action="store_true",
         help="Run the Qt controller without launching the MuJoCo viewer.",
@@ -246,16 +659,35 @@ def main():
     """Launch the target q/qdot ESN GUI and simulation worker."""
     args = parse_args(sys.argv[1:])
     simulation = build_esn_target_simulation(args)
-    worker = SimulationWorker(simulation, launch_viewer=not args.no_viewer)
+    trajectory_player = None
+    if args.trajectory_pkl is not None:
+        target_qpos, target_qvel = _load_target_trajectory(
+            args.trajectory_pkl,
+            args.trajectory_fps,
+        )
+        trajectory_player = TargetTrajectoryPlayer(
+            simulation,
+            target_qpos,
+            target_qvel,
+            args.trajectory_fps,
+            loop=args.trajectory_loop,
+        )
+    worker = TrajectorySimulationWorker(
+        simulation,
+        trajectory_player=trajectory_player,
+        launch_viewer=not args.no_viewer,
+    )
 
     app = QApplication(sys.argv[:1])
     window = ESNTargetContactControlWindow(
         worker,
         args.position_range,
         args.refresh_ms,
+        args.plot_window,
     )
     worker.start()
     window.show()
+    window.tracking_window.show()
     exit_code = app.exec_()
     worker.stop()
     raise SystemExit(exit_code)

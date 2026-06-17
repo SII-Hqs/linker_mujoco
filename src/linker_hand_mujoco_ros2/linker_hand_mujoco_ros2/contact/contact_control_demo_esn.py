@@ -152,6 +152,7 @@ def build_esn_simulation(args):
         data,
         "moving_platform_geom",
         force_clip=args.force_clip,
+        force_scale=args.force_scale,
     )
 
     esn = ESNTorqueController(
@@ -258,6 +259,7 @@ def add_esn_arguments(parser):
     parser.add_argument("--torque-rate-limit", type=float, default=None)
     parser.add_argument("--filter-cutoff-hz", type=float, default=None)
     parser.add_argument("--force-clip", type=float, default=5.0)
+    parser.add_argument("--force-scale", type=float, default=0.1)
     parser.add_argument("--damping", type=float, default=0.8)
     parser.add_argument(
         "--solref",

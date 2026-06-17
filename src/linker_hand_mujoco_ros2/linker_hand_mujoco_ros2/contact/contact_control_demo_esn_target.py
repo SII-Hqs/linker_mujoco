@@ -334,8 +334,8 @@ def add_esn_target_arguments(parser):
     parser.add_argument(
         "--gravity-z",
         type=float,
-        default=0.0,
-        help="World Z gravity. Defaults to 0.0 so no-contact motion stays quiet.",
+        default=-9.81,
+        help="World Z gravity in m/s^2.",
     )
     return parser
 

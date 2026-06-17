@@ -28,10 +28,12 @@ class ContactObserver:
         platform_geom_name,
         ignored_geom_names=("floor",),
         force_clip=20.0,
+        force_scale=1.0,
     ):
         self.model = model
         self.data = data
         self.force_clip = float(force_clip)
+        self.force_scale = float(force_scale)
         self.platform_geom_id = mujoco.mj_name2id(
             model,
             mujoco.mjtObj.mjOBJ_GEOM,
@@ -76,11 +78,12 @@ class ContactObserver:
             geoms.append(geom_name)
 
         point_array = np.vstack(points) if points else np.empty((0, 3), dtype=float)
+        scaled_force = normal_force * self.force_scale
         return ContactState(
             in_contact=bool(points),
-            normal_force=min(normal_force, self.force_clip),
-            raw_normal_force=normal_force,
-            force_world=force_world,
+            normal_force=min(scaled_force, self.force_clip),
+            raw_normal_force=scaled_force,
+            force_world=force_world * self.force_scale,
             points=point_array,
             geoms=tuple(sorted(set(geoms))),
         )

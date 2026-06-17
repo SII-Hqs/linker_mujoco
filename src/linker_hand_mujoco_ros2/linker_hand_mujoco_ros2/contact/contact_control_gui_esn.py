@@ -2,7 +2,9 @@
 """Interactive PyQt5 GUI for the L20a ESN torque-control contact demo."""
 
 import argparse
+import pickle
 import sys
+import time as _time
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,7 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -107,6 +110,44 @@ class ReservoirHeatmapWidget(QGroupBox):
         self.update_from_esn()
 
 
+class TrajectoryRecorder:
+    """Record index finger qpos and qvel at each simulation step."""
+
+    def __init__(self):
+        self.recording = False
+        self.qpos_list = []
+        self.qvel_list = []
+
+    def start(self):
+        """Start recording (clears previous data)."""
+        self.qpos_list = []
+        self.qvel_list = []
+        self.recording = True
+
+    def stop(self):
+        """Stop recording."""
+        self.recording = False
+
+    def record(self, qpos, qvel):
+        """Append one frame if recording is active."""
+        if self.recording:
+            self.qpos_list.append(np.asarray(qpos, dtype=float).copy())
+            self.qvel_list.append(np.asarray(qvel, dtype=float).copy())
+
+    @property
+    def frame_count(self):
+        return len(self.qpos_list)
+
+    def export(self, path):
+        """Save recorded trajectory to a pkl file."""
+        data = {
+            "qpos": np.array(self.qpos_list),
+            "qvel": np.array(self.qvel_list),
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+
+
 class ESNContactControlWindow(QMainWindow):
     """GUI for XYZ platform control and ESN torque monitoring."""
 
@@ -116,6 +157,7 @@ class ESNContactControlWindow(QMainWindow):
         self.initial_pos = self.worker.simulation.platform.initial_pos.copy()
         self.position_range = float(position_range)
         self.position_inputs = {}
+        self.recorder = TrajectoryRecorder()
 
         self.setWindowTitle("L20a ESN Contact Platform Control")
         self.setMinimumWidth(520)
@@ -174,6 +216,23 @@ class ESNContactControlWindow(QMainWindow):
         button_layout.addWidget(reset_esn_button)
         root_layout.addLayout(button_layout)
 
+        # Trajectory recording
+        record_group = QGroupBox("轨迹录制")
+        record_layout = QFormLayout(record_group)
+        self.record_frame_label = QLabel("0 帧")
+        self.record_frame_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        record_layout.addRow("已录制:", self.record_frame_label)
+        record_btn_layout = QHBoxLayout()
+        self.record_start_button = QPushButton("开始录制")
+        self.record_start_button.clicked.connect(self.toggle_recording)
+        record_btn_layout.addWidget(self.record_start_button)
+        self.record_export_button = QPushButton("导出 pkl")
+        self.record_export_button.clicked.connect(self.export_trajectory)
+        self.record_export_button.setEnabled(False)
+        record_btn_layout.addWidget(self.record_export_button)
+        record_layout.addRow(record_btn_layout)
+        root_layout.addWidget(record_group)
+
         # Contact state display
         contact_group = QGroupBox("Contact State")
         contact_layout = QFormLayout(contact_group)
@@ -222,12 +281,40 @@ class ESNContactControlWindow(QMainWindow):
         """Reset the ESN reservoir and filters."""
         self.worker.simulation.controller.reset()
 
+    def toggle_recording(self, *_args):
+        """Start or stop trajectory recording."""
+        if self.recorder.recording:
+            self.recorder.stop()
+            self.record_start_button.setText("开始录制")
+            self.record_export_button.setEnabled(self.recorder.frame_count > 0)
+        else:
+            self.recorder.start()
+            self.record_start_button.setText("停止录制")
+            self.record_export_button.setEnabled(False)
+
+    def export_trajectory(self, *_args):
+        """Export recorded q/dq trajectory to a pkl file."""
+        if self.recorder.frame_count == 0:
+            return
+        default_name = f"trajectory_{int(_time.time())}.pkl"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出轨迹", default_name, "Pickle Files (*.pkl)"
+        )
+        if path:
+            self.recorder.export(path)
+
     def refresh_status(self):
         """Refresh displayed contact state and worker health."""
         if self.worker.error is not None:
             self.contact_label.setText(f"Error: {self.worker.error}")
             self.refresh_timer.stop()
             return
+
+        sim = self.worker.simulation
+        qpos = sim.data.qpos[sim.index_dof_ids]
+        qvel = sim.data.qvel[sim.index_dof_ids]
+        self.recorder.record(qpos, qvel)
+        self.record_frame_label.setText(f"{self.recorder.frame_count} 帧")
 
         state = self.worker.get_contact_state()
         self.contact_label.setText("Contact" if state.in_contact else "No contact")
