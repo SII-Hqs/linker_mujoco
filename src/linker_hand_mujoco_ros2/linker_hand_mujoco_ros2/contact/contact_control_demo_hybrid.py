@@ -12,10 +12,10 @@ import mujoco.viewer
 import numpy as np
 
 if __package__:
-    from ..contact_observer import ContactObserver
-    from ..hybrid_controller import HybridForcePositionController
-    from ..platform_controller import MovingPlatformController
-    from ..position_command_mapper import PositionCommandMapper
+    from .observer import ContactObserver
+    from ..controllers.hybrid import HybridForcePositionController
+    from ..controllers.platform import MovingPlatformController
+    from ..controllers.position_mapper import PositionCommandMapper
     from .contact_control_demo import (
         default_finger_vec,
         default_model_xml,
@@ -29,10 +29,10 @@ else:
         default_model_xml,
         load_finger_frame,
     )
-    from linker_hand_mujoco_ros2.contact_observer import ContactObserver
-    from linker_hand_mujoco_ros2.hybrid_controller import HybridForcePositionController
-    from linker_hand_mujoco_ros2.platform_controller import MovingPlatformController
-    from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
+    from linker_hand_mujoco_ros2.contact.observer import ContactObserver
+    from linker_hand_mujoco_ros2.controllers.hybrid import HybridForcePositionController
+    from linker_hand_mujoco_ros2.controllers.platform import MovingPlatformController
+    from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
 
 
 @dataclass

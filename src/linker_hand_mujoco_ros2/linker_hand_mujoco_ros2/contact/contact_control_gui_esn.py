@@ -2,11 +2,14 @@
 """Interactive PyQt5 GUI for the L20a ESN torque-control contact demo."""
 
 import argparse
+import collections
 import pickle
 import sys
+import threading
 import time as _time
 from pathlib import Path
 
+import mujoco
 import numpy as np
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
@@ -31,6 +34,7 @@ if __package__:
         build_esn_simulation,
     )
     from .contact_control_gui import SimulationWorker
+    from .viewer_camera import ViewerCameraMixin
 else:
     package_source = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(package_source))
@@ -39,6 +43,43 @@ else:
         build_esn_simulation,
     )
     from linker_hand_mujoco_ros2.contact.contact_control_gui import SimulationWorker
+    from linker_hand_mujoco_ros2.contact.viewer_camera import ViewerCameraMixin
+
+
+def _find_mesh_geom_id(model, mesh_name):
+    """Return the first geom using the named mesh."""
+    geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, mesh_name)
+    if geom_id >= 0:
+        return geom_id
+
+    mesh_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MESH, mesh_name)
+    if mesh_id < 0:
+        raise ValueError(f"mesh not found: {mesh_name}")
+
+    for geom_id in range(model.ngeom):
+        if int(model.geom_dataid[geom_id]) == mesh_id:
+            return geom_id
+    raise ValueError(f"geom using mesh not found: {mesh_name}")
+
+
+def _get_link3_link4_midpoint(data, link3_body_id, link4_geom_id):
+    """Return the world-space midpoint between index_link3 and index_link4."""
+    link3_pos = data.xpos[link3_body_id]
+    link4_pos = data.geom_xpos[link4_geom_id]
+    return 0.5 * (link3_pos + link4_pos)
+
+
+def _set_white_viewer_background(model):
+    """Use a white MuJoCo viewer background and floor for this model."""
+    model.vis.rgba.haze[:] = np.array([1.0, 1.0, 1.0, 1.0], dtype=float)
+    floor_geom_id = mujoco.mj_name2id(
+        model,
+        mujoco.mjtObj.mjOBJ_GEOM,
+        "floor",
+    )
+    if floor_geom_id >= 0:
+        model.geom_matid[floor_geom_id] = -1
+        model.geom_rgba[floor_geom_id] = np.array([1.0, 1.0, 1.0, 1.0], dtype=float)
 
 
 class ReservoirHeatmapWidget(QGroupBox):
@@ -110,6 +151,129 @@ class ReservoirHeatmapWidget(QGroupBox):
         self.update_from_esn()
 
 
+class MujocoTrajectoryVisualizer:
+    """Draw the index fingertip trajectory in MuJoCo viewer."""
+
+    def __init__(self, max_points=None, max_segments=1200):
+        maxlen = None if max_points is None else int(max_points)
+        self.positions = collections.deque(maxlen=maxlen)
+        self.max_segments = int(max_segments)
+        self.lock = threading.Lock()
+        self.visible = True
+
+    def update_position(self, pos):
+        """Append one world-space position."""
+        with self.lock:
+            self.positions.append(np.asarray(pos, dtype=float).reshape(3).copy())
+
+    def clear_trajectory(self):
+        """Clear all stored trajectory points."""
+        with self.lock:
+            self.positions.clear()
+
+    def toggle_visible(self):
+        """Toggle trajectory visibility and return the new state."""
+        with self.lock:
+            self.visible = not self.visible
+            return self.visible
+
+    def draw(self, viewer):
+        """Render the trajectory into viewer.user_scn."""
+        scene = viewer.user_scn
+        scene.ngeom = 0
+
+        with self.lock:
+            if not self.visible or not self.positions:
+                return
+            points = np.asarray(self.positions, dtype=float)
+
+        max_geoms = getattr(scene, "maxgeom", None)
+        if max_geoms is None:
+            max_geoms = len(scene.geoms)
+        if max_geoms <= 0:
+            return
+
+        segment_limit = min(max_geoms - 1, self.max_segments, max(len(points) - 1, 0))
+        if segment_limit > 0:
+            if len(points) > segment_limit + 1:
+                sample_idx = np.linspace(0, len(points) - 1, segment_limit + 1).astype(
+                    int
+                )
+                draw_points = points[sample_idx]
+            else:
+                draw_points = points
+            old_color = np.array([0.02, 0.05, 0.22, 0.35], dtype=float)
+            new_color = np.array([0.0, 1.0, 1.0, 0.95], dtype=float)
+            denom = max(len(draw_points) - 2, 1)
+            for idx, (start, end) in enumerate(zip(draw_points[:-1], draw_points[1:])):
+                if scene.ngeom >= max_geoms - 1:
+                    break
+                mujoco.mjv_connector(
+                    scene.geoms[scene.ngeom],
+                    mujoco.mjtGeom.mjGEOM_CAPSULE,
+                    0.0010,
+                    start,
+                    end,
+                )
+                t = float(idx) / float(denom)
+                scene.geoms[scene.ngeom].rgba[:] = old_color + t * (
+                    new_color - old_color
+                )
+                scene.ngeom += 1
+
+        if scene.ngeom < max_geoms:
+            identity = np.eye(3).reshape(-1)
+            marker_size = np.array([0.003, 0.003, 0.003], dtype=float)
+            marker_color = np.array([0.0, 1.0, 1.0, 0.18], dtype=float)
+            mujoco.mjv_initGeom(
+                scene.geoms[scene.ngeom],
+                mujoco.mjtGeom.mjGEOM_SPHERE,
+                marker_size,
+                points[-1],
+                identity,
+                marker_color,
+            )
+            scene.ngeom += 1
+
+
+class ESNTrajectoryWorker(ViewerCameraMixin, SimulationWorker):
+    """Simulation worker with MuJoCo viewer fingertip trajectory overlay."""
+
+    def __init__(self, simulation, launch_viewer=True, camera_path=None):
+        super().__init__(simulation, launch_viewer=launch_viewer)
+        self._init_camera_controls(camera_path)
+        self.tip_body_id = mujoco.mj_name2id(
+            self.simulation.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            "index_link3",
+        )
+        if self.tip_body_id < 0:
+            raise ValueError("body not found: index_link3")
+        self.tip_geom_id = _find_mesh_geom_id(self.simulation.model, "index_link4")
+        self.trajectory_visualizer = MujocoTrajectoryVisualizer()
+
+    def clear_tip_trajectory(self):
+        """Clear the MuJoCo viewer trajectory."""
+        self.trajectory_visualizer.clear_trajectory()
+
+    def toggle_tip_trajectory_visible(self):
+        """Toggle MuJoCo trajectory visibility."""
+        return self.trajectory_visualizer.toggle_visible()
+
+    def _step_once(self):
+        super()._step_once()
+        tip_pos = _get_link3_link4_midpoint(
+            self.simulation.data,
+            self.tip_body_id,
+            self.tip_geom_id,
+        ).copy()
+        self.trajectory_visualizer.update_position(tip_pos)
+
+    def _draw_viewer_overlays(self, viewer):
+        """Draw fingertip trajectory in the MuJoCo viewer."""
+        self.trajectory_visualizer.draw(viewer)
+
+
 class TrajectoryRecorder:
     """Record index finger qpos and qvel at each simulation step."""
 
@@ -158,7 +322,6 @@ class ESNContactControlWindow(QMainWindow):
         self.position_range = float(position_range)
         self.position_inputs = {}
         self.recorder = TrajectoryRecorder()
-
         self.setWindowTitle("L20a ESN Contact Platform Control")
         self.setMinimumWidth(520)
         self.setCentralWidget(self._build_content())
@@ -214,6 +377,18 @@ class ESNContactControlWindow(QMainWindow):
         reset_esn_button = QPushButton("重置 ESN")
         reset_esn_button.clicked.connect(self.reset_esn)
         button_layout.addWidget(reset_esn_button)
+        clear_trajectory_button = QPushButton("清除轨迹")
+        clear_trajectory_button.clicked.connect(self.clear_trajectory)
+        button_layout.addWidget(clear_trajectory_button)
+        self.toggle_trajectory_button = QPushButton("隐藏轨迹")
+        self.toggle_trajectory_button.clicked.connect(self.toggle_trajectory_visibility)
+        button_layout.addWidget(self.toggle_trajectory_button)
+        save_camera_button = QPushButton("保存视角")
+        save_camera_button.clicked.connect(self.save_camera)
+        button_layout.addWidget(save_camera_button)
+        load_camera_button = QPushButton("加载视角")
+        load_camera_button.clicked.connect(self.load_camera)
+        button_layout.addWidget(load_camera_button)
         root_layout.addLayout(button_layout)
 
         # Trajectory recording
@@ -280,6 +455,34 @@ class ESNContactControlWindow(QMainWindow):
     def reset_esn(self, *_args):
         """Reset the ESN reservoir and filters."""
         self.worker.simulation.controller.reset()
+
+    def clear_trajectory(self, *_args):
+        """Clear the MuJoCo viewer trajectory."""
+        if hasattr(self.worker, "clear_tip_trajectory"):
+            self.worker.clear_tip_trajectory()
+
+    def toggle_trajectory_visibility(self, *_args):
+        """Show or hide the MuJoCo viewer trajectory."""
+        if not hasattr(self.worker, "toggle_tip_trajectory_visible"):
+            return
+        visible = self.worker.toggle_tip_trajectory_visible()
+        self.toggle_trajectory_button.setText("隐藏轨迹" if visible else "显示轨迹")
+
+    def save_camera(self, *_args):
+        """Save current MuJoCo viewer camera."""
+        try:
+            path = self.worker.save_camera()
+            self.contact_label.setText(f"Camera saved: {path}")
+        except Exception as exc:
+            self.contact_label.setText(f"Camera save failed: {exc}")
+
+    def load_camera(self, *_args):
+        """Load saved MuJoCo viewer camera."""
+        try:
+            path = self.worker.load_camera()
+            self.contact_label.setText(f"Camera loaded: {path}")
+        except Exception as exc:
+            self.contact_label.setText(f"Camera load failed: {exc}")
 
     def toggle_recording(self, *_args):
         """Start or stop trajectory recording."""
@@ -350,6 +553,12 @@ def parse_args(argv):
         action="store_true",
         help="Run the Qt controller without launching the MuJoCo viewer.",
     )
+    parser.add_argument(
+        "--camera-view",
+        type=Path,
+        default=Path("mujoco_camera_view.json"),
+        help="JSON file used by the save/load camera buttons.",
+    )
     return parser.parse_args(argv)
 
 
@@ -357,7 +566,12 @@ def main():
     """Launch the ESN-control GUI and simulation worker."""
     args = parse_args(sys.argv[1:])
     simulation = build_esn_simulation(args)
-    worker = SimulationWorker(simulation, launch_viewer=not args.no_viewer)
+    _set_white_viewer_background(simulation.model)
+    worker = ESNTrajectoryWorker(
+        simulation,
+        launch_viewer=not args.no_viewer,
+        camera_path=args.camera_view,
+    )
 
     app = QApplication(sys.argv[:1])
     window = ESNContactControlWindow(worker, args.position_range, args.refresh_ms)

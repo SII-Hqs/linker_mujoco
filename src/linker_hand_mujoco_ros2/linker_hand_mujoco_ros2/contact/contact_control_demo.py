@@ -13,17 +13,17 @@ import mujoco.viewer
 import numpy as np
 
 if __package__:
-    from ..contact_observer import ContactObserver
-    from ..platform_controller import MovingPlatformController
-    from ..position_command_mapper import PositionCommandMapper
-    from ..reflex_controller import ReflexIndexController
+    from .observer import ContactObserver
+    from ..controllers.platform import MovingPlatformController
+    from ..controllers.position_mapper import PositionCommandMapper
+    from ..controllers.reflex import ReflexIndexController
 else:
     package_source = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(package_source))
-    from linker_hand_mujoco_ros2.contact_observer import ContactObserver
-    from linker_hand_mujoco_ros2.platform_controller import MovingPlatformController
-    from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
-    from linker_hand_mujoco_ros2.reflex_controller import ReflexIndexController
+    from linker_hand_mujoco_ros2.contact.observer import ContactObserver
+    from linker_hand_mujoco_ros2.controllers.platform import MovingPlatformController
+    from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
+    from linker_hand_mujoco_ros2.controllers.reflex import ReflexIndexController
 
 numpy_core = getattr(np, "_core", np.core)
 sys.modules.setdefault("numpy._core", numpy_core)

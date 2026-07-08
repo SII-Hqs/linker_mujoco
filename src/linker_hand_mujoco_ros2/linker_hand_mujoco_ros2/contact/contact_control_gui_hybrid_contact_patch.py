@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
 )
 
 if __package__:
-    from ..position_command_mapper import PositionCommandMapper
+    from ..controllers.position_mapper import PositionCommandMapper
     from .contact_control_demo import default_finger_vec, default_model_xml, load_finger_frame
     from .contact_control_demo_torque import (
         clip_to_joint_ranges,
@@ -60,7 +60,7 @@ else:
     )
     from linker_hand_mujoco_ros2.contact.contact_patch import ContactPatchCalculator
     from linker_hand_mujoco_ros2.contact.contact_visualizer import ContactVisualizer
-    from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
+    from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
 
 
 def contact_force_g_to_n(contact_force_g):

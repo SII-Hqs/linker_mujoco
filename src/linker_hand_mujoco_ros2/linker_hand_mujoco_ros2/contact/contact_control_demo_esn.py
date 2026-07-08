@@ -13,10 +13,11 @@ import mujoco.viewer
 import numpy as np
 
 if __package__:
-    from ..contact_observer import ContactObserver
-    from ..mujoco_esn_controller import ControlRateAdapter, ESNTorqueController
-    from ..platform_controller import MovingPlatformController
-    from ..position_command_mapper import PositionCommandMapper
+    from ..io.package_paths import resource_path
+    from .observer import ContactObserver
+    from ..controllers.esn import ControlRateAdapter, ESNTorqueController
+    from ..controllers.platform import MovingPlatformController
+    from ..controllers.position_mapper import PositionCommandMapper
     from .contact_control_demo import (
         default_finger_vec,
         load_finger_frame,
@@ -28,6 +29,7 @@ if __package__:
 else:
     package_source = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(package_source))
+    from linker_hand_mujoco_ros2.io.package_paths import resource_path
     from linker_hand_mujoco_ros2.contact.contact_control_demo import (
         default_finger_vec,
         load_finger_frame,
@@ -36,20 +38,21 @@ else:
         clip_to_joint_ranges,
         default_torque_model_xml,
     )
-    from linker_hand_mujoco_ros2.contact_observer import ContactObserver
-    from linker_hand_mujoco_ros2.mujoco_esn_controller import (
+    from linker_hand_mujoco_ros2.contact.observer import ContactObserver
+    from linker_hand_mujoco_ros2.controllers.esn import (
         ControlRateAdapter,
         ESNTorqueController,
     )
-    from linker_hand_mujoco_ros2.platform_controller import MovingPlatformController
-    from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
+    from linker_hand_mujoco_ros2.controllers.platform import MovingPlatformController
+    from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
 
 
 def default_esn_model_path():
     """Return the default ESN model .npz path shipped with the package."""
-    return (
-        Path(__file__).resolve().parents[1]
-        / "esn_controller_no_tau_history_seed67_60hz.npz"
+    return resource_path(
+        "resources",
+        "weights",
+        "esn_controller_no_tau_history_seed67_60hz.npz",
     )
 
 
@@ -65,6 +68,23 @@ def _find_actuator_ids_for_joints(model, joint_names):
     if not actuator_ids:
         raise ValueError(f"no actuators found for joints: {joint_names}")
     return actuator_ids
+
+
+def _close_non_index_fingers(model, joint_names, command):
+    """Return an initial command with all non-index fingers closed."""
+    closed = np.asarray(command, dtype=float).copy()
+    for i, joint_name in enumerate(joint_names):
+        if joint_name.startswith("index_"):
+            continue
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if joint_id < 0:
+            continue
+        joint_min, joint_max = model.jnt_range[joint_id]
+        if joint_name.endswith("_joint0"):
+            closed[i] = np.clip(0.0, joint_min, joint_max)
+        else:
+            closed[i] = joint_max
+    return closed
 
 
 @dataclass
@@ -124,6 +144,7 @@ def build_esn_simulation(args):
         args.finger_vec,
         args.initial_frame,
     )
+    initial_command = _close_non_index_fingers(model, joint_names, initial_command)
     initial_command = clip_to_joint_ranges(model, joint_names, initial_command)
     mapper = PositionCommandMapper(model, joint_names)
     mapper.apply_qpos(data, initial_command)

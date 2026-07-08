@@ -2,6 +2,7 @@
 """Run the L20a contact demo with a target q/qdot ESN torque controller."""
 
 import argparse
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -13,13 +14,14 @@ import mujoco.viewer
 import numpy as np
 
 if __package__:
-    from ..contact_observer import ContactObserver
-    from ..mujoco_esn_controller_target_q_dq import (
+    from ..io.package_paths import resource_path
+    from .observer import ContactObserver
+    from ..controllers.esn_target_q_dq_1 import (
         ControlRateAdapter,
         ESNTorqueController,
     )
-    from ..platform_controller import MovingPlatformController
-    from ..position_command_mapper import PositionCommandMapper
+    from ..controllers.platform import MovingPlatformController
+    from ..controllers.position_mapper import PositionCommandMapper
     from .contact_control_demo import (
         default_finger_vec,
         load_finger_frame,
@@ -31,6 +33,7 @@ if __package__:
 else:
     package_source = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(package_source))
+    from linker_hand_mujoco_ros2.io.package_paths import resource_path
     from linker_hand_mujoco_ros2.contact.contact_control_demo import (
         default_finger_vec,
         load_finger_frame,
@@ -39,21 +42,75 @@ else:
         clip_to_joint_ranges,
         default_torque_model_xml,
     )
-    from linker_hand_mujoco_ros2.contact_observer import ContactObserver
-    from linker_hand_mujoco_ros2.mujoco_esn_controller_target_q_dq import (
+    from linker_hand_mujoco_ros2.contact.observer import ContactObserver
+    from linker_hand_mujoco_ros2.controllers.esn_target_q_dq_1 import (
         ControlRateAdapter,
         ESNTorqueController,
     )
-    from linker_hand_mujoco_ros2.platform_controller import MovingPlatformController
-    from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
+    from linker_hand_mujoco_ros2.controllers.platform import MovingPlatformController
+    from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
 
 
 def default_esn_model_path():
     """Return the default target q/qdot ESN model .npz path."""
-    return (
-        Path(__file__).resolve().parents[1]
-        / "esn_controller_target_q_dq_7_seed30_60hz.npz"
+    return resource_path(
+        "resources",
+        "weights",
+        "esn_controller_target_q_dq_1_seed30_60hz.npz",
     )
+
+
+def default_initial_qpos_path():
+    """Return the default trajectory used for initial index-finger qpos."""
+    return resource_path(
+        "resources",
+        "trajectories",
+        "trajectory_1781583721_cycle_30fps.pkl",
+    )
+
+
+def _load_initial_qpos(initial_qpos_pkl):
+    """Load the first index-finger qpos frame from a trajectory pkl."""
+    with Path(initial_qpos_pkl).open("rb") as file:
+        payload = pickle.load(file)
+
+    if isinstance(payload, dict) and "qpos" in payload:
+        qpos = np.asarray(payload["qpos"], dtype=float)
+    elif isinstance(payload, dict) and "data" in payload:
+        joint_data = np.asarray(payload["data"], dtype=float)
+        target_joint_names = ["index_joint1", "index_joint2", "index_joint3"]
+        joint_names = payload.get("meta_data", {}).get("joint_names", [])
+        if all(name in joint_names for name in target_joint_names):
+            columns = [joint_names.index(name) for name in target_joint_names]
+        else:
+            if joint_data.ndim != 2 or joint_data.shape[1] < 4:
+                raise ValueError("initial qpos data must contain at least 4 columns")
+            columns = [1, 2, 3]
+        qpos = joint_data[:, columns]
+    else:
+        qpos = np.asarray(payload, dtype=float)
+
+    if qpos.ndim != 2 or qpos.shape[1] != 3 or qpos.shape[0] == 0:
+        raise ValueError("initial qpos trajectory must have shape (N, 3)")
+    return qpos[0].copy()
+
+
+def apply_initial_index_qpos(model, data, initial_qpos_pkl):
+    """Set index_joint1/2/3 qpos from the first frame of a trajectory pkl."""
+    if initial_qpos_pkl is None:
+        return
+
+    initial_qpos = _load_initial_qpos(initial_qpos_pkl)
+    for value, joint_name in zip(
+        initial_qpos,
+        ("index_joint1", "index_joint2", "index_joint3"),
+    ):
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if joint_id < 0:
+            raise ValueError(f"initial qpos joint not found: {joint_name}")
+        joint_min, joint_max = model.jnt_range[joint_id]
+        dof_id = int(model.jnt_dofadr[joint_id])
+        data.qpos[dof_id] = np.clip(value, joint_min, joint_max)
 
 
 def _find_actuator_ids_for_joints(model, joint_names):
@@ -147,6 +204,7 @@ def build_esn_target_simulation(args):
     mapper.apply_qpos(data, initial_command)
     data.ctrl[:] = 0.0
     data.qvel[:] = 0.0
+    apply_initial_index_qpos(model, data, args.initial_qpos_pkl)
     mujoco.mj_forward(model, data)
 
     platform = MovingPlatformController(
@@ -274,11 +332,12 @@ def add_esn_target_arguments(parser):
     parser.add_argument("--esn-model", type=Path, default=default_esn_model_path())
     parser.add_argument("--finger-vec", type=Path, default=default_finger_vec())
     parser.add_argument("--initial-frame", type=int, default=0)
+    parser.add_argument("--initial-qpos-pkl", type=Path, default=default_initial_qpos_path())
     parser.add_argument("--target", default="index_link1")
     parser.add_argument("--platform-top-offset", type=float, default=0.075)
     parser.add_argument("--platform-initial-x", type=float, default=0.24212)
     parser.add_argument("--platform-initial-y", type=float, default=0.03445)
-    parser.add_argument("--platform-initial-z", type=float, default=0.31972)
+    parser.add_argument("--platform-initial-z", type=float, default=0.2)
     parser.add_argument("--platform-stroke", type=float, default=0.004)
     parser.add_argument("--platform-period", type=float, default=4.0)
     parser.add_argument(
@@ -309,7 +368,7 @@ def add_esn_target_arguments(parser):
         metavar=("DQ1", "DQ2", "DQ3"),
         help="Target joint velocities for the controlled joints in rad/s.",
     )
-    parser.add_argument("--horizon", type=int, default=1)
+    parser.add_argument("--horizon", type=int, default=0)
     parser.add_argument("--torque-limit", type=float, default=2.0)
     parser.add_argument("--torque-rate-limit", type=float, default=None)
     parser.add_argument("--filter-cutoff-hz", type=float, default=None)

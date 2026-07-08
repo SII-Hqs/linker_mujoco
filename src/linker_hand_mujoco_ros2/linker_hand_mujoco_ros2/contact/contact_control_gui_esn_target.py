@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Interactive PyQt5 GUI for the target q/qdot ESN contact demo."""
+"""Interactive PyQt5 GUI for the t+1 target q/qdot ESN contact demo."""
 
 import argparse
 import pickle
 import sys
 from pathlib import Path
 
+import mujoco
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import QTimer, Qt
@@ -20,7 +21,6 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -31,7 +31,14 @@ if __package__:
         build_esn_target_simulation,
     )
     from .contact_control_gui import SimulationWorker
-    from .contact_control_gui_esn import ReservoirHeatmapWidget
+    from .contact_control_gui_esn import (
+        MujocoTrajectoryVisualizer,
+        ReservoirHeatmapWidget,
+        _find_mesh_geom_id,
+        _get_link3_link4_midpoint,
+    )
+    from .tracking_metrics_logger import TrackingMetricsLogger
+    from .viewer_camera import ViewerCameraMixin
 else:
     package_source = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(package_source))
@@ -41,8 +48,15 @@ else:
     )
     from linker_hand_mujoco_ros2.contact.contact_control_gui import SimulationWorker
     from linker_hand_mujoco_ros2.contact.contact_control_gui_esn import (
+        MujocoTrajectoryVisualizer,
         ReservoirHeatmapWidget,
+        _find_mesh_geom_id,
+        _get_link3_link4_midpoint,
     )
+    from linker_hand_mujoco_ros2.contact.tracking_metrics_logger import (
+        TrackingMetricsLogger,
+    )
+    from linker_hand_mujoco_ros2.contact.viewer_camera import ViewerCameraMixin
 
 
 def _load_target_trajectory(trajectory_pkl, trajectory_fps):
@@ -129,7 +143,14 @@ class TargetTrajectoryPlayer:
         self.frame = frame
         self.feature_frame = feature_frame
         self.simulation.target_qpos[:] = self.target_qpos[feature_frame]
-        self.simulation.target_qvel[:] = self.target_qvel[feature_frame]
+        target_qvel = self.target_qvel[feature_frame]
+        if (
+            not self.loop
+            and not self.playing
+            and feature_frame == len(self.target_qvel) - 1
+        ):
+            target_qvel = np.zeros_like(target_qvel)
+        self.simulation.target_qvel[:] = target_qvel
 
     def update(self):
         """Advance target according to MuJoCo simulation time."""
@@ -142,7 +163,8 @@ class TargetTrajectoryPlayer:
             frame = raw_frame % frame_count
         else:
             frame = min(raw_frame, frame_count - 1)
-            if raw_frame >= frame_count - 1:
+            reached_end = raw_frame >= frame_count - 1
+            if reached_end:
                 self.playing = False
         self.apply_frame(frame)
 
@@ -162,6 +184,13 @@ class TargetTrajectoryPlayer:
 
     def snapshot(self):
         """Return compact playback status."""
+        tracking_qvel = self.target_qvel[self.frame].copy()
+        feature_qvel = self.target_qvel[self.feature_frame].copy()
+        if not self.loop and not self.playing:
+            if self.frame == len(self.target_qvel) - 1:
+                tracking_qvel[:] = 0.0
+            if self.feature_frame == len(self.target_qvel) - 1:
+                feature_qvel[:] = 0.0
         return {
             "frame": self.frame,
             "feature_frame": self.feature_frame,
@@ -170,18 +199,36 @@ class TargetTrajectoryPlayer:
             "loop": self.loop,
             "feature_offset": self.feature_offset,
             "tracking_qpos": self.target_qpos[self.frame].copy(),
-            "tracking_qvel": self.target_qvel[self.frame].copy(),
+            "tracking_qvel": tracking_qvel,
             "feature_qpos": self.target_qpos[self.feature_frame].copy(),
-            "feature_qvel": self.target_qvel[self.feature_frame].copy(),
+            "feature_qvel": feature_qvel,
         }
 
 
-class TrajectorySimulationWorker(SimulationWorker):
+class TrajectorySimulationWorker(ViewerCameraMixin, SimulationWorker):
     """Simulation worker that updates target trajectory before each step."""
 
-    def __init__(self, simulation, trajectory_player=None, launch_viewer=True):
+    def __init__(
+        self,
+        simulation,
+        trajectory_player=None,
+        launch_viewer=True,
+        camera_path=None,
+        metrics_logger=None,
+    ):
         super().__init__(simulation, launch_viewer=launch_viewer)
+        self._init_camera_controls(camera_path)
         self.trajectory_player = trajectory_player
+        self.metrics_logger = metrics_logger
+        self.tip_body_id = mujoco.mj_name2id(
+            self.simulation.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            "index_link3",
+        )
+        if self.tip_body_id < 0:
+            raise ValueError("body not found: index_link3")
+        self.tip_geom_id = _find_mesh_geom_id(self.simulation.model, "index_link4")
+        self.trajectory_visualizer = MujocoTrajectoryVisualizer()
 
     @property
     def trajectory_active(self):
@@ -192,6 +239,51 @@ class TrajectorySimulationWorker(SimulationWorker):
         if self.trajectory_player is not None:
             self.trajectory_player.update()
         super()._step_once()
+        self._log_tracking_metrics()
+        tip_pos = _get_link3_link4_midpoint(
+            self.simulation.data,
+            self.tip_body_id,
+            self.tip_geom_id,
+        ).copy()
+        self.trajectory_visualizer.update_position(tip_pos)
+
+    def _log_tracking_metrics(self):
+        """Record one target-tracking sample after the simulation step."""
+        if self.metrics_logger is None:
+            return
+        if self.trajectory_player is None:
+            trajectory = {
+                "frame": 0,
+                "tracking_qpos": self.simulation.target_qpos.copy(),
+            }
+        else:
+            trajectory = self.trajectory_player.snapshot()
+        self.metrics_logger.sample(
+            self.simulation.data.time,
+            trajectory["frame"],
+            trajectory["tracking_qpos"],
+            self.simulation.current_qpos(),
+            self.simulation.controller.last_tau,
+            self.simulation.model.opt.timestep,
+        )
+
+    def stop(self):
+        """Stop simulation stepping and close the optional metrics logger."""
+        super().stop()
+        if self.metrics_logger is not None:
+            self.metrics_logger.close()
+
+    def clear_tip_trajectory(self):
+        """Clear the MuJoCo viewer fingertip trajectory."""
+        self.trajectory_visualizer.clear_trajectory()
+
+    def toggle_tip_trajectory_visible(self):
+        """Toggle MuJoCo fingertip trajectory visibility."""
+        return self.trajectory_visualizer.toggle_visible()
+
+    def _draw_viewer_overlays(self, viewer):
+        """Draw fingertip trajectory in the MuJoCo viewer."""
+        self.trajectory_visualizer.draw(viewer)
 
     def toggle_trajectory_playing(self):
         """Pause or resume trajectory playback."""
@@ -441,12 +533,11 @@ class ESNTargetContactControlWindow(QMainWindow):
         esn_group = QGroupBox("ESN Controller")
         esn_layout = QFormLayout(esn_group)
         esn_ctrl = self.worker.simulation.controller
-        self.horizon_input = QSpinBox()
         horizons = esn_ctrl.controller.horizons
-        self.horizon_input.setRange(min(horizons), max(horizons))
-        self.horizon_input.setValue(esn_ctrl.horizon)
-        self.horizon_input.valueChanged.connect(self.update_horizon)
-        esn_layout.addRow("Horizon:", self.horizon_input)
+        horizon_text = ", ".join(str(horizon) for horizon in horizons)
+        self.horizon_label = QLabel(horizon_text)
+        self.horizon_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        esn_layout.addRow("Output horizon:", self.horizon_label)
         root_layout.addWidget(esn_group)
 
         self.reservoir_widget = ReservoirHeatmapWidget(esn_ctrl.controller)
@@ -459,6 +550,18 @@ class ESNTargetContactControlWindow(QMainWindow):
         reset_esn_button = QPushButton("重置 ESN")
         reset_esn_button.clicked.connect(self.reset_esn)
         button_layout.addWidget(reset_esn_button)
+        clear_trajectory_button = QPushButton("清除轨迹")
+        clear_trajectory_button.clicked.connect(self.clear_trajectory)
+        button_layout.addWidget(clear_trajectory_button)
+        self.toggle_trajectory_button = QPushButton("隐藏轨迹")
+        self.toggle_trajectory_button.clicked.connect(self.toggle_trajectory_visibility)
+        button_layout.addWidget(self.toggle_trajectory_button)
+        save_camera_button = QPushButton("保存视角")
+        save_camera_button.clicked.connect(self.save_camera)
+        button_layout.addWidget(save_camera_button)
+        load_camera_button = QPushButton("加载视角")
+        load_camera_button.clicked.connect(self.load_camera)
+        button_layout.addWidget(load_camera_button)
         root_layout.addLayout(button_layout)
 
         contact_group = QGroupBox("Contact State")
@@ -506,10 +609,6 @@ class ESNTargetContactControlWindow(QMainWindow):
             spin_box.value() for spin_box in self.target_qvel_inputs
         ]
 
-    def update_horizon(self, value):
-        """Update the ESN prediction horizon at runtime."""
-        self.worker.simulation.controller.horizon = value
-
     def reset_platform(self, *_args):
         """Reset platform inputs and target to the initial position."""
         for axis, value in zip(("X", "Y", "Z"), self.initial_pos):
@@ -522,6 +621,31 @@ class ESNTargetContactControlWindow(QMainWindow):
     def reset_esn(self, *_args):
         """Reset the ESN reservoir and filters."""
         self.worker.simulation.controller.reset()
+
+    def clear_trajectory(self, *_args):
+        """Clear the MuJoCo viewer fingertip trajectory."""
+        self.worker.clear_tip_trajectory()
+
+    def toggle_trajectory_visibility(self, *_args):
+        """Show or hide the MuJoCo viewer fingertip trajectory."""
+        visible = self.worker.toggle_tip_trajectory_visible()
+        self.toggle_trajectory_button.setText("隐藏轨迹" if visible else "显示轨迹")
+
+    def save_camera(self, *_args):
+        """Save current MuJoCo viewer camera."""
+        try:
+            path = self.worker.save_camera()
+            self.contact_label.setText(f"Camera saved: {path}")
+        except Exception as exc:
+            self.contact_label.setText(f"Camera save failed: {exc}")
+
+    def load_camera(self, *_args):
+        """Load saved MuJoCo viewer camera."""
+        try:
+            path = self.worker.load_camera()
+            self.contact_label.setText(f"Camera loaded: {path}")
+        except Exception as exc:
+            self.contact_label.setText(f"Camera load failed: {exc}")
 
     def toggle_trajectory_playback(self, *_args):
         """Pause or resume trajectory playback."""
@@ -612,9 +736,9 @@ class ESNTargetContactControlWindow(QMainWindow):
 
 
 def parse_args(argv):
-    """Parse target q/qdot ESN GUI and shared simulation arguments."""
+    """Parse t+1 target q/qdot ESN GUI and shared simulation arguments."""
     parser = argparse.ArgumentParser(
-        description="Interactively control the L20a target q/qdot ESN platform."
+        description="Interactively control the L20a t+1 target q/qdot ESN platform."
     )
     add_esn_target_arguments(parser)
     parser.add_argument(
@@ -652,7 +776,55 @@ def parse_args(argv):
         action="store_true",
         help="Run the Qt controller without launching the MuJoCo viewer.",
     )
+    parser.add_argument(
+        "--camera-view",
+        type=Path,
+        default=Path("mujoco_camera_view.json"),
+        help="JSON file used by the save/load camera buttons.",
+    )
+    parser.add_argument(
+        "--metrics-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV path for qpos tracking and torque metrics.",
+    )
+    parser.add_argument(
+        "--metrics-summary",
+        type=Path,
+        default=None,
+        help="Optional JSON path for aggregate tracking metrics.",
+    )
+    parser.add_argument(
+        "--metrics-start-time",
+        type=float,
+        default=None,
+        help="Optional simulation time to start recording metrics.",
+    )
+    parser.add_argument(
+        "--metrics-end-time",
+        type=float,
+        default=None,
+        help="Optional simulation time to stop recording metrics.",
+    )
     return parser.parse_args(argv)
+
+
+def _build_metrics_metadata(args):
+    """Return compact experiment metadata stored with metrics summaries."""
+    return {
+        "trajectory_pkl": args.trajectory_pkl,
+        "trajectory_fps": args.trajectory_fps,
+        "trajectory_loop": args.trajectory_loop,
+        "model_xml": args.model_xml,
+        "esn_model": args.esn_model,
+        "horizon": args.horizon,
+        "solref": args.solref,
+        "solimp": args.solimp,
+        "torque_limit": args.torque_limit,
+        "torque_rate_limit": args.torque_rate_limit,
+        "damping": args.damping,
+        "gravity_z": args.gravity_z,
+    }
 
 
 def main():
@@ -676,6 +848,19 @@ def main():
         simulation,
         trajectory_player=trajectory_player,
         launch_viewer=not args.no_viewer,
+        camera_path=args.camera_view,
+        metrics_logger=(
+            TrackingMetricsLogger(
+                "esn",
+                csv_path=args.metrics_csv,
+                summary_path=args.metrics_summary,
+                metadata=_build_metrics_metadata(args),
+                start_time=args.metrics_start_time,
+                end_time=args.metrics_end_time,
+            )
+            if args.metrics_csv is not None or args.metrics_summary is not None
+            else None
+        ),
     )
 
     app = QApplication(sys.argv[:1])

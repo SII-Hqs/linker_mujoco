@@ -47,11 +47,18 @@ python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_contr
 * 控制平台运动+esn可视化+目标位置
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target.py --solref 0.02 1.0 --target-qpos 0.332 0.254 0.271
 
-* 控制平台运动+esn可视化+目标轨迹
+* 控制平台运动+esn可视化+目标轨迹，并导出跟踪误差/力矩指标
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target.py \
   --solref 0.02 1.0 \
-  --trajectory-pkl src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/trajectory_1781583721.pkl \
-  --trajectory-fps 30
+  --trajectory-pkl src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/resources/trajectories/trajectory_1781583721_cycle_58_30fps.pkl \
+  --trajectory-fps 30 \
+  --metrics-csv results/tracking_metrics/esn_target.csv
+
+python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_pid_target.py \
+  --solref 0.02 1.0 \
+  --trajectory-pkl src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/resources/trajectories/trajectory_1781583721_cycle_58_30fps.pkl \
+  --trajectory-fps 30 \
+  --metrics-csv results/tracking_metrics/pid_target.csv
 
 * esn可视化+目标位置+注入力（感觉这样不太好，台抽象了）
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target_contact_patch.py --solref 0.02 1.0 --target-qpos 0.332 0.254 0.271

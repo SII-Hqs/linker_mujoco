@@ -1,0 +1,40 @@
+{
+  "controller": "pid",
+  "csv_path": "results/tracking_metrics/pid_target_new.csv",
+  "duration": 2.4979999999999465,
+  "end_time": 2.4999999999999463,
+  "joint_names": [
+    "index_joint1",
+    "index_joint2",
+    "index_joint3"
+  ],
+  "metadata": {
+    "damping": 0.8,
+    "gravity_z": -9.81,
+    "init_to_trajectory": false,
+    "integral_limit": 1.0,
+    "kd": 2.0,
+    "ki": 0.0,
+    "kp": 20.0,
+    "model_xml": "/home/maker4090/Code/linker_mujoco/src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/urdf/L20a/linker_hand_l20a_right/linker_hand_l20a_right_contact_platform_torque.xml",
+    "solimp": null,
+    "solref": [
+      0.02,
+      1.0
+    ],
+    "torque_limit": 10.0,
+    "torque_rate_limit": null,
+    "trajectory_fps": 30.0,
+    "trajectory_loop": false,
+    "trajectory_pkl": "src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/resources/trajectories/trajectory_1781583721_cycle_58_30fps.pkl"
+  },
+  "metrics_end_time": 2.5,
+  "metrics_start_time": 0.0,
+  "sample_count": 1250,
+  "start_time": 0.002,
+  "torque_integral": 4.691958485645008,
+  "torque_rms": 2.1363351440497538,
+  "tracking_mae": 0.08428107118813608,
+  "tracking_max_error": 0.18174482927697436,
+  "tracking_rmse": 0.09400576504107301
+}

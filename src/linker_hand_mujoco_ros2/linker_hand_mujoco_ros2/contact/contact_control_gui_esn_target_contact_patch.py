@@ -32,8 +32,8 @@ from PyQt5.QtWidgets import (
 )
 
 if __package__:
-    from ..mujoco_esn_controller_target_q_dq import ESNTorqueController
-    from ..position_command_mapper import PositionCommandMapper
+    from ..controllers.esn_target_q_dq import ESNTorqueController
+    from ..controllers.position_mapper import PositionCommandMapper
     from .contact_control_demo import default_finger_vec, load_finger_frame
     from .contact_control_demo_esn_target import default_esn_model_path
     from .contact_control_demo_torque import (
@@ -62,8 +62,8 @@ else:
     )
     from linker_hand_mujoco_ros2.contact.contact_patch import ContactPatchCalculator
     from linker_hand_mujoco_ros2.contact.contact_visualizer import ContactVisualizer
-    from linker_hand_mujoco_ros2.mujoco_esn_controller_target_q_dq import ESNTorqueController
-    from linker_hand_mujoco_ros2.position_command_mapper import PositionCommandMapper
+    from linker_hand_mujoco_ros2.controllers.esn_target_q_dq import ESNTorqueController
+    from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
 
 
 def contact_force_g_to_n(contact_force_g):
