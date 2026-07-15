@@ -62,3 +62,25 @@ python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_contr
 
 * esn可视化+目标位置+注入力（感觉这样不太好，台抽象了）
 python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target_contact_patch.py --solref 0.02 1.0 --target-qpos 0.332 0.254 0.271
+
+
+# ESN两种控制模式
+## self-organization（最有展示度的参数：X0.23212 m,Z0.29772 m）
+python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn.py
+## trajectry-target
+python src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/contact/contact_control_gui_esn_target.py   --solref 0.02 1.0   --trajectory-pkl src/linker_hand_mujoco_ros2/linker_hand_mujoco_ros2/resources/trajectories/trajectory_1781583721_clean_30fps.pkl   --trajectory-fps 30 
+
+
+# 0706调试
+## 动补手套+mujoco
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+* 本脚本
+  * ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2.launch.py hand_type:=left hand_joint:=L20
+* 联合脚本
+  * (linker_retargeting) maker4090@maker4090-X870-EAGLE-WIFI7:~/Code/linkerhand_telop_python-master/ros2$ ros2 run linkerhand_retarget handretarget
+### 当前数据通信ok，但是重定向效果一般，主要集中在大拇指关节自由度缺失（l20）
+### o6还没开始调，在看重定向相关的资料
+### 手套不包含手腕的自由度
+
+  

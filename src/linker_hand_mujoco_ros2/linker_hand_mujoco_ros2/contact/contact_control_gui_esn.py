@@ -87,22 +87,26 @@ class ReservoirHeatmapWidget(QGroupBox):
 
     def __init__(self, esn, parent=None):
         super().__init__("ESN Reservoir", parent)
-        self.esn = esn
-        self.nr = int(esn.nr)
-        self.rows = int(np.ceil(np.sqrt(self.nr)))
-        self.cols = int(np.ceil(self.nr / self.rows))
+        self.image_label = QLabel()
+        self.stats_label = QLabel()
+        self.set_esn(esn)
 
         layout = QVBoxLayout(self)
-        self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(360, 260)
         self.image_label.setStyleSheet("background: #111; border: 1px solid #555;")
-        self.stats_label = QLabel("Nr=0 step=0 min=0.000 max=0.000")
         self.stats_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self.image_label)
         layout.addWidget(self.stats_label)
 
         self.update_from_esn()
+
+    def set_esn(self, esn):
+        """Switch the heatmap to another ESN reservoir."""
+        self.esn = esn
+        self.nr = int(esn.nr)
+        self.rows = int(np.ceil(np.sqrt(self.nr)))
+        self.cols = int(np.ceil(self.nr / self.rows))
 
     def update_from_esn(self):
         """Read the ESN state and refresh the heatmap image."""
@@ -359,14 +363,14 @@ class ESNContactControlWindow(QMainWindow):
         esn_layout = QFormLayout(esn_group)
         esn_ctrl = self.worker.simulation.controller
         self.horizon_input = QSpinBox()
-        horizons = esn_ctrl.controller.horizons
+        horizons = esn_ctrl.horizons
         self.horizon_input.setRange(min(horizons), max(horizons))
         self.horizon_input.setValue(esn_ctrl.horizon)
         self.horizon_input.valueChanged.connect(self.update_horizon)
         esn_layout.addRow("Horizon:", self.horizon_input)
         root_layout.addWidget(esn_group)
 
-        self.reservoir_widget = ReservoirHeatmapWidget(esn_ctrl.controller)
+        self.reservoir_widget = ReservoirHeatmapWidget(esn_ctrl.active_controller)
         root_layout.addWidget(self.reservoir_widget)
 
         # Buttons
@@ -442,6 +446,10 @@ class ESNContactControlWindow(QMainWindow):
     def update_horizon(self, value):
         """Update the ESN prediction horizon at runtime."""
         self.worker.simulation.controller.horizon = value
+        self.reservoir_widget.set_esn(
+            self.worker.simulation.controller.active_controller
+        )
+        self.reservoir_widget.update_from_esn()
 
     def reset_platform(self, *_args):
         """Reset platform inputs and target to the initial position."""

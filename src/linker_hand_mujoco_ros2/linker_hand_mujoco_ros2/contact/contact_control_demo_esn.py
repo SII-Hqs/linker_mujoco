@@ -15,7 +15,10 @@ import numpy as np
 if __package__:
     from ..io.package_paths import resource_path
     from .observer import ContactObserver
-    from ..controllers.esn import ControlRateAdapter, ESNTorqueController
+    from ..controllers.esn import ESNTorqueController as HorizonESNTorqueController
+    from ..controllers.mujoco_esn_controller_current_torque import (
+        ESNTorqueController as CurrentESNTorqueController,
+    )
     from ..controllers.platform import MovingPlatformController
     from ..controllers.position_mapper import PositionCommandMapper
     from .contact_control_demo import (
@@ -40,20 +43,36 @@ else:
     )
     from linker_hand_mujoco_ros2.contact.observer import ContactObserver
     from linker_hand_mujoco_ros2.controllers.esn import (
-        ControlRateAdapter,
-        ESNTorqueController,
+        ESNTorqueController as HorizonESNTorqueController,
+    )
+    from linker_hand_mujoco_ros2.controllers.mujoco_esn_controller_current_torque import (
+        ESNTorqueController as CurrentESNTorqueController,
     )
     from linker_hand_mujoco_ros2.controllers.platform import MovingPlatformController
     from linker_hand_mujoco_ros2.controllers.position_mapper import PositionCommandMapper
 
 
-def default_esn_model_path():
-    """Return the default ESN model .npz path shipped with the package."""
+def default_current_esn_model_path():
+    """Return the current-torque ESN model path used by horizon 0."""
+    return resource_path(
+        "resources",
+        "weights",
+        "esn_controller_current_torque_seed52_60hz.npz",
+    )
+
+
+def default_horizon_esn_model_path():
+    """Return the previous multi-horizon ESN model path used by horizon 1."""
     return resource_path(
         "resources",
         "weights",
         "esn_controller_no_tau_history_seed67_60hz.npz",
     )
+
+
+def default_esn_model_path():
+    """Return the default ESN model path for backward-compatible CLI use."""
+    return default_current_esn_model_path()
 
 
 def _find_actuator_ids_for_joints(model, joint_names):
@@ -87,6 +106,78 @@ def _close_non_index_fingers(model, joint_names, command):
     return closed
 
 
+class HorizonSwitchingControlRateAdapter:
+    """Switch between the current-torque ESN and the previous horizon ESN."""
+
+    horizons = (0, 1)
+
+    def __init__(self, current_controller, horizon_controller, sim_dt, horizon=0):
+        if sim_dt <= 0:
+            raise ValueError("sim_dt must be positive")
+        if current_controller.joint_ids != horizon_controller.joint_ids:
+            raise ValueError(
+                "current-torque and horizon ESN joint_ids must match: "
+                f"{current_controller.joint_ids} != {horizon_controller.joint_ids}"
+            )
+        if 1 not in horizon_controller.horizons:
+            raise ValueError(
+                f"previous ESN must support horizon 1, got {horizon_controller.horizons}"
+            )
+
+        self.current_controller = current_controller
+        self.horizon_controller = horizon_controller
+        self.joint_ids = current_controller.joint_ids
+        self.sim_dt = float(sim_dt)
+        self.update_period = 1.0 / float(current_controller.fs_hz)
+        self.elapsed = 0.0
+        self.last_tau = np.zeros(3, dtype=float)
+        self._horizon = 0
+        self.horizon = horizon
+
+    @property
+    def horizon(self):
+        return self._horizon
+
+    @horizon.setter
+    def horizon(self, value):
+        value = int(value)
+        if value not in self.horizons:
+            raise ValueError(f"horizon must be one of {self.horizons}")
+        changed = value != self._horizon
+        self._horizon = value
+        if changed:
+            self.elapsed = self.update_period
+
+    @property
+    def active_controller(self):
+        if self.horizon == 0:
+            return self.current_controller
+        return self.horizon_controller
+
+    def reset(self):
+        """Reset both ESN reservoirs and the output-rate limiter state."""
+        self.current_controller.reset()
+        self.horizon_controller.reset()
+        self.elapsed = 0.0
+        self.last_tau = np.zeros(3, dtype=float)
+
+    def step(self, qpos, qvel, force_g):
+        """Update torque only when the trained ESN control period has elapsed."""
+        self.elapsed += self.sim_dt
+        if self.elapsed >= self.update_period:
+            self.elapsed -= self.update_period
+            if self.horizon == 0:
+                self.last_tau = self.current_controller.step(qpos, qvel, force_g)
+            else:
+                self.last_tau = self.horizon_controller.step(
+                    qpos,
+                    qvel,
+                    force_g,
+                    horizon=1,
+                )
+        return self.last_tau.copy()
+
+
 @dataclass
 class ESNContactSimulation:
     """Objects required to step the ESN contact-control simulation."""
@@ -95,7 +186,7 @@ class ESNContactSimulation:
     data: object
     platform: MovingPlatformController
     observer: ContactObserver
-    controller: ControlRateAdapter
+    controller: HorizonSwitchingControlRateAdapter
     index_dof_ids: List[int] = field(default_factory=list)
     index_actuator_ids: List[int] = field(default_factory=list)
 
@@ -176,20 +267,28 @@ def build_esn_simulation(args):
         force_scale=args.force_scale,
     )
 
-    esn = ESNTorqueController(
-        model_path=args.esn_model,
+    current_esn_model = args.esn_model if args.esn_model is not None else args.current_esn_model
+    current_esn = CurrentESNTorqueController(
+        model_path=current_esn_model,
         torque_limit=args.torque_limit,
         torque_rate_limit=args.torque_rate_limit,
         filter_cutoff_hz=args.filter_cutoff_hz,
     )
-    controller = ControlRateAdapter(
-        esn,
+    horizon_esn = HorizonESNTorqueController(
+        model_path=args.horizon_esn_model,
+        torque_limit=args.torque_limit,
+        torque_rate_limit=args.torque_rate_limit,
+        filter_cutoff_hz=args.filter_cutoff_hz,
+    )
+    controller = HorizonSwitchingControlRateAdapter(
+        current_esn,
+        horizon_esn,
         sim_dt=model.opt.timestep,
         horizon=args.horizon,
     )
 
     # Resolve the 3 controlled joints from the ESN model metadata.
-    esn_joint_names = [f"index_joint{i}" for i in esn.joint_ids]
+    esn_joint_names = [f"index_joint{i}" for i in controller.joint_ids]
     index_dof_ids = []
     for name in esn_joint_names:
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -209,9 +308,10 @@ def run_demo(args):
     simulation = build_esn_simulation(args)
     print("ESN contact-control demo started.")
     print(f"model: {args.model_xml}")
-    print(f"esn: {args.esn_model}")
+    print(f"current ESN: {args.esn_model if args.esn_model is not None else args.current_esn_model}")
+    print(f"horizon ESN: {args.horizon_esn_model}")
     print(f"target: {args.target}")
-    print(f"horizon: {args.horizon}")
+    print(f"horizon: {simulation.controller.horizon}")
     print("Press Ctrl+C in the terminal to stop.", flush=True)
 
     last_log = -args.log_interval
@@ -253,7 +353,24 @@ def run_demo(args):
 def add_esn_arguments(parser):
     """Add ESN-control demo arguments to an argument parser."""
     parser.add_argument("--model-xml", type=Path, default=default_torque_model_xml())
-    parser.add_argument("--esn-model", type=Path, default=default_esn_model_path())
+    parser.add_argument(
+        "--esn-model",
+        type=Path,
+        default=None,
+        help="Backward-compatible alias for --current-esn-model.",
+    )
+    parser.add_argument(
+        "--current-esn-model",
+        type=Path,
+        default=default_current_esn_model_path(),
+        help="ESN weight used when Horizon is 0.",
+    )
+    parser.add_argument(
+        "--horizon-esn-model",
+        type=Path,
+        default=default_horizon_esn_model_path(),
+        help="Previous multi-horizon ESN weight used when Horizon is 1.",
+    )
     parser.add_argument("--finger-vec", type=Path, default=default_finger_vec())
     parser.add_argument("--initial-frame", type=int, default=0)
     parser.add_argument("--target", default="index_link1")
@@ -275,7 +392,7 @@ def add_esn_arguments(parser):
         default=0.0,
         help="Raise the lowest point by this amount (meters).",
     )
-    parser.add_argument("--horizon", type=int, default=1)
+    parser.add_argument("--horizon", type=int, choices=(0, 1), default=0)
     parser.add_argument("--torque-limit", type=float, default=2.0)
     parser.add_argument("--torque-rate-limit", type=float, default=None)
     parser.add_argument("--filter-cutoff-hz", type=float, default=None)

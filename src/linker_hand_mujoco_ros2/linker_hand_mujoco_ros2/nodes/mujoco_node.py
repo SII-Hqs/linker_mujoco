@@ -5,7 +5,11 @@ from rcl_interfaces.msg import ParameterDescriptor
 import rclpy.time
 from std_msgs.msg import String, Header, Float32MultiArray
 from sensor_msgs.msg import JointState
+import csv
 import time,threading, json
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 
 import sys,os
@@ -14,8 +18,8 @@ from sensor_msgs.msg import JointState
 import numpy as np
 import mujoco, time
 import mujoco.viewer
-from PyQt5.QtWidgets import QApplication, QWidget, QSlider, QVBoxLayout, QLabel
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication, QWidget, QSlider, QVBoxLayout, QLabel, QPushButton
+from PyQt5.QtCore import Qt, QTimer
 from linker_hand_mujoco_ros2.io.package_paths import resource_path
 from linker_hand_mujoco_ros2.utils.mapping import *
 
@@ -41,13 +45,138 @@ JOINT_CONFIG = {
         "arc": L21_JOINT_ARC,
     }
 }
+
+MIN_MUJOCO_MASS = 1e-6
+MIN_MUJOCO_INERTIA = 1e-9
+
+
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _temp_path(suffix, prefix):
+    temp_dir = Path(tempfile.gettempdir()) / "linker_hand_mujoco_ros2"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix, dir=temp_dir)
+    os.close(fd)
+    return Path(path)
+
+
+def _resolve_model_path(hand_joint, hand_type):
+    hand_joint = hand_joint.upper()
+    hand_type = hand_type.lower()
+    if hand_joint == "O20":
+        return resource_path("urdf", f"o20_{hand_type}", f"linkerhand_o20_{hand_type}.urdf")
+    if hand_joint == "L20A":
+        model_name = f"linker_hand_l20a_{hand_type}"
+        return resource_path("urdf", "L20a", model_name, f"{model_name}.xml")
+
+    model_name = f"linker_hand_{hand_joint.lower()}_{hand_type}"
+    return resource_path("urdf", hand_joint, model_name, f"{model_name}.xml")
+
+
+def _sanitize_urdf_for_mujoco(urdf_path):
+    urdf_path = Path(urdf_path)
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+
+    for mesh in root.iter("mesh"):
+        filename = mesh.get("filename")
+        if not filename or filename.startswith("package://") or Path(filename).is_absolute():
+            continue
+        mesh.set("filename", str((urdf_path.parent / filename).resolve()))
+
+    for inertial in root.iter("inertial"):
+        mass = inertial.find("mass")
+        if mass is not None and _to_float(mass.get("value")) <= MIN_MUJOCO_MASS:
+            mass.set("value", f"{MIN_MUJOCO_MASS:g}")
+
+        inertia = inertial.find("inertia")
+        if inertia is None:
+            continue
+        for attr in ("ixx", "iyy", "izz"):
+            if _to_float(inertia.get(attr)) <= MIN_MUJOCO_INERTIA:
+                inertia.set(attr, f"{MIN_MUJOCO_INERTIA:g}")
+
+    output_path = _temp_path(".urdf", f"{urdf_path.stem}_mujoco_")
+    ET.indent(root, space="  ")
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    return output_path
+
+
+def _make_actuated_mjcf_from_urdf(urdf_path):
+    sanitized_urdf_path = _sanitize_urdf_for_mujoco(urdf_path)
+    model = mujoco.MjModel.from_xml_path(str(sanitized_urdf_path))
+    mjcf_path = _temp_path(".xml", f"{Path(urdf_path).stem}_actuated_")
+    mujoco.mj_saveLastXML(str(mjcf_path), model)
+
+    tree = ET.parse(mjcf_path)
+    root = tree.getroot()
+    actuator = root.find("actuator")
+    if actuator is None:
+        actuator = ET.SubElement(root, "actuator")
+
+    hinge_type = int(mujoco.mjtJoint.mjJNT_HINGE)
+    slide_type = int(mujoco.mjtJoint.mjJNT_SLIDE)
+    for joint_id in range(model.njnt):
+        if int(model.jnt_type[joint_id]) not in (hinge_type, slide_type):
+            continue
+        joint_name = model.joint(joint_id).name
+        if not joint_name:
+            continue
+        ctrl_min, ctrl_max = model.jnt_range[joint_id]
+        if not model.jnt_limited[joint_id] or ctrl_min == ctrl_max:
+            ctrl_min, ctrl_max = -1.57, 1.57
+        ET.SubElement(
+            actuator,
+            "position",
+            {
+                "name": f"{joint_name}_pos",
+                "joint": joint_name,
+                "kp": "10",
+                "ctrllimited": "true",
+                "ctrlrange": f"{ctrl_min:g} {ctrl_max:g}",
+            },
+        )
+
+    ET.indent(root, space="    ")
+    tree.write(mjcf_path, encoding="utf-8", xml_declaration=True)
+    return mjcf_path
+
+
+def _prepare_mujoco_model_path(hand_joint, hand_type):
+    model_path = _resolve_model_path(hand_joint, hand_type)
+    if hand_joint.upper() == "O20":
+        return _make_actuated_mjcf_from_urdf(model_path)
+    return model_path
+
+
+def _mapping_joint_name(hand_joint):
+    hand_joint = hand_joint.upper()
+    if hand_joint == "L20A":
+        return "L20"
+    return hand_joint
+
+
 class MujocoNode(Node):
     def __init__(self):
         super().__init__('linker_hand_mujoco_ros2_node')
         self.declare_parameter("hand_type", "right")
-        self.hand_type = self.get_parameter('hand_type').get_parameter_value().string_value
+        self.hand_type = self.get_parameter('hand_type').get_parameter_value().string_value.lower()
         self.declare_parameter("hand_joint", "L10")
-        self.hand_joint = self.get_parameter('hand_joint').get_parameter_value().string_value
+        self.hand_joint = self.get_parameter('hand_joint').get_parameter_value().string_value.upper()
+        self.mapping_joint = _mapping_joint_name(self.hand_joint)
         self.declare_parameter("initial_position", [], ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter("show_contact_patch", True)
         self.declare_parameter("contact_patch_link", "index_link3")
@@ -57,11 +186,15 @@ class MujocoNode(Node):
         self.declare_parameter("contact_patch_max_points", 120)
         self.declare_parameter("contact_force_sigma", 0.002)
         self.declare_parameter("contact_force_arrow_scale", 0.2)
+        self.declare_parameter("record_joint_state", False)
+        self.declare_parameter("joint_state_log_path", "")
+        self.declare_parameter("joint_state_log_hz", 60.0)
+        self.declare_parameter("record_control_gui", True)
         self.create_subscription(JointState,f"/cb_{self.hand_type}_hand_control_cmd",self.hand_cb,10)
         self.create_subscription(Float32MultiArray,f"/cb_{self.hand_type}_hand_contact_cmd",self.hand_contact_cb,10)
         self.index_torque_pub = self.create_publisher(JointState, f"/cb_{self.hand_type}_hand_index_contact_torque", 10)
         # 直接通过字典获取配置
-        joint_config = JOINT_CONFIG.get(self.hand_joint)
+        joint_config = JOINT_CONFIG.get(self.mapping_joint)
         if joint_config:
             self.joint_map = joint_config["map"]
             self.joint_arc = joint_config["arc"]
@@ -69,12 +202,8 @@ class MujocoNode(Node):
             # 处理未匹配的情况（可选）
             self.joint_map = None
             self.joint_arc = None
-        XML_PATH = resource_path(
-            "urdf",
-            self.hand_joint.upper(),
-            f"linker_hand_{self.hand_joint.lower()}_{self.hand_type}",
-            f"linker_hand_{self.hand_joint.lower()}_{self.hand_type}.xml",
-        )
+        XML_PATH = _prepare_mujoco_model_path(self.hand_joint, self.hand_type)
+        self.get_logger().info(f"Loading MuJoCo model: {XML_PATH}")
 
         # --- 加载模型 ---
         self.model = mujoco.MjModel.from_xml_path(str(XML_PATH))
@@ -82,6 +211,8 @@ class MujocoNode(Node):
         self.data = mujoco.MjData(self.model)
         joint_count = self.model.nu
         self.ctrl_values = np.zeros(joint_count)
+        # 获取 actuator 控制范围（注意：actuator 不是 joint 本体）
+        self.ctrl_ranges = self.model.actuator_ctrlrange.copy()
 
 
         print("=" * 20,flush=True)
@@ -98,33 +229,35 @@ class MujocoNode(Node):
             joint_name = self.model.joint(i).name  # 获取第i个关节的名称
             joint_names.append(joint_name)
             print(f"Joint {i}: {joint_name}",flush=True)
-        # 获取 actuator 控制范围（注意：actuator 不是 joint 本体）
-        self.ctrl_ranges = self.model.actuator_ctrlrange.copy()
+        self.setup_joint_state_recording()
         self.setup_contact_patch_visualization()
-        sim_thread = threading.Thread(target=self.mujoco_thread)
+        sim_thread = threading.Thread(target=self.mujoco_thread, daemon=True)
         sim_thread.start()
         
 
 
     # --- MuJoCo 模拟线程 ---
     def mujoco_thread(self):
-        with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
-            print("MuJoCo viewer running...")
-            while viewer.is_running():
-                with viewer.lock():
-                    self.data.ctrl[:] = self.ctrl_values
-                    mujoco.mj_step(self.model, self.data)
-                    self.update_contact_patch()
-                    self.draw_contact_patch(viewer)
-                viewer.sync()
-                time.sleep(0.001)
+        try:
+            with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+                print("MuJoCo viewer running...")
+                while viewer.is_running():
+                    with viewer.lock():
+                        self.data.ctrl[:] = self.ctrl_values
+                        mujoco.mj_step(self.model, self.data)
+                        self.record_joint_state_sample()
+                        self.update_contact_patch()
+                        self.draw_contact_patch(viewer)
+                    viewer.sync()
+                    time.sleep(0.001)
+        finally:
+            self.close_joint_state_log()
 
 
     def hand_cb(self,data):
         position = data.position
         try:
-            if self.joint_map is not None:
-                self.ctrl_values[:] = self.control_position_to_actuator(position)
+            self.ctrl_values[:] = self.control_position_to_actuator(position)
         except Exception as e:
             self.get_logger().error(f"Error in hand_cb: {e}")
         time.sleep(0.01)  # 确保数据处理的间隔时间
@@ -138,8 +271,7 @@ class MujocoNode(Node):
 
         position = values[:-1]
         try:
-            if self.joint_map is not None:
-                self.ctrl_values[:] = self.control_position_to_actuator(position)
+            self.ctrl_values[:] = self.control_position_to_actuator(position)
             self.contact_force_g = float(values[-1])
             now = time.time()
             if now - self.last_contact_cmd_log_time > 1.0:
@@ -167,14 +299,27 @@ class MujocoNode(Node):
 
 
     def control_position_to_actuator(self, position):
+        if self.joint_map is None:
+            return self.direct_position_to_actuator(position)
+
         if self.hand_type == "left":
-            tmp = range_to_arc_left(position, self.hand_joint)
+            tmp = range_to_arc_left(position, self.mapping_joint)
         elif self.hand_type == "right":
-            tmp = range_to_arc_right(position, self.hand_joint)
+            tmp = range_to_arc_right(position, self.mapping_joint)
         else:
             raise ValueError(f"Unsupported hand_type: {self.hand_type}")
 
         return self.map_position_array(tmp, self.joint_map)
+
+
+    def direct_position_to_actuator(self, position):
+        mapped_array = [0.0] * len(self.ctrl_ranges)
+        count = min(len(position), len(self.ctrl_ranges))
+        for idx in range(count):
+            ctrl_min, ctrl_max = self.ctrl_ranges[idx]
+            value = is_within_range(position[idx], 0, 255)
+            mapped_array[idx] = scale_value(value, 0, 255, ctrl_min, ctrl_max)
+        return mapped_array
 
 
     def map_position_array(self, position, joint_map):
@@ -185,6 +330,159 @@ class MujocoNode(Node):
                 mapped_array[target_idx] = position[source_idx]
         
         return mapped_array
+
+
+    def setup_joint_state_recording(self):
+        self.joint_state_log_lock = threading.Lock()
+        initial_recording = _to_bool(self.get_parameter("record_joint_state").value)
+        self.record_joint_state = False
+        self.joint_state_log_file = None
+        self.joint_state_log_writer = None
+        self.joint_state_log_path = None
+        self.joint_state_log_base_path = str(self.get_parameter("joint_state_log_path").value).strip()
+        self.joint_state_log_specs = []
+        self.joint_state_log_count = 0
+        self.joint_state_log_interval = 1.0 / max(
+            _to_float(self.get_parameter("joint_state_log_hz").value, 60.0),
+            1e-6,
+        )
+        self.last_joint_state_log_time = -self.joint_state_log_interval
+
+        hinge_type = int(mujoco.mjtJoint.mjJNT_HINGE)
+        slide_type = int(mujoco.mjtJoint.mjJNT_SLIDE)
+        for joint_id in range(self.model.njnt):
+            joint_name = self.model.joint(joint_id).name
+            if not joint_name or "thumb" in joint_name.lower():
+                continue
+            if int(self.model.jnt_type[joint_id]) not in (hinge_type, slide_type):
+                continue
+            self.joint_state_log_specs.append(
+                (
+                    joint_name,
+                    int(self.model.jnt_qposadr[joint_id]),
+                    int(self.model.jnt_dofadr[joint_id]),
+                )
+            )
+
+        if not self.joint_state_log_specs:
+            self.get_logger().warning("Joint-state recording disabled: no non-thumb joints found")
+            return
+
+        if initial_recording:
+            self.start_joint_state_recording()
+
+
+    def _next_joint_state_log_path(self):
+        if self.joint_state_log_base_path:
+            log_path = Path(self.joint_state_log_base_path).expanduser()
+            if not log_path.is_absolute():
+                log_path = Path.cwd() / log_path
+            if not log_path.exists():
+                return log_path
+
+            stem = log_path.stem
+            suffix = log_path.suffix or ".csv"
+            parent = log_path.parent
+            index = 1
+            while True:
+                candidate = parent / f"{stem}_{index}{suffix}"
+                if not candidate.exists():
+                    return candidate
+                index += 1
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        msec = int((time.time() % 1.0) * 1000.0)
+        return (
+            Path.cwd()
+            / "results"
+            / "joint_logs"
+            / f"{self.hand_joint.lower()}_{self.hand_type}_{timestamp}_{msec:03d}.csv"
+        )
+
+
+    def start_joint_state_recording(self):
+        with self.joint_state_log_lock:
+            if self.record_joint_state:
+                return self.joint_state_log_path
+            if not self.joint_state_log_specs:
+                self.get_logger().warning("Cannot start joint-state recording: no non-thumb joints found")
+                return None
+
+            log_path = self._next_joint_state_log_path()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.joint_state_log_file = log_path.open("w", newline="")
+            self.joint_state_log_writer = csv.writer(self.joint_state_log_file)
+
+            joint_names = [item[0] for item in self.joint_state_log_specs]
+            self.joint_state_log_writer.writerow(
+                ["sim_time", "wall_time"]
+                + [f"qpos_{name}" for name in joint_names]
+                + [f"qvel_{name}" for name in joint_names]
+            )
+            self.joint_state_log_file.flush()
+            self.joint_state_log_path = log_path
+            self.joint_state_log_count = 0
+            self.last_joint_state_log_time = -self.joint_state_log_interval
+            self.record_joint_state = True
+            self.get_logger().info(
+                f"Started recording {len(joint_names)} non-thumb joints to {log_path} "
+                f"at {1.0 / self.joint_state_log_interval:.2f} Hz"
+            )
+            return log_path
+
+
+    def stop_joint_state_recording(self):
+        with self.joint_state_log_lock:
+            self.record_joint_state = False
+            if self.joint_state_log_file is None:
+                return self.joint_state_log_path, self.joint_state_log_count
+            try:
+                self.joint_state_log_file.flush()
+                self.joint_state_log_file.close()
+                self.get_logger().info(
+                    f"Stopped joint-state recording: {self.joint_state_log_path} "
+                    f"({self.joint_state_log_count} samples)"
+                )
+                return self.joint_state_log_path, self.joint_state_log_count
+            finally:
+                self.joint_state_log_file = None
+                self.joint_state_log_writer = None
+
+
+    def toggle_joint_state_recording(self):
+        if self.record_joint_state:
+            return False, self.stop_joint_state_recording()
+        return True, (self.start_joint_state_recording(), self.joint_state_log_count)
+
+
+    def record_joint_state_sample(self):
+        with self.joint_state_log_lock:
+            if (
+                not self.record_joint_state
+                or self.joint_state_log_writer is None
+                or self.data.time - self.last_joint_state_log_time < self.joint_state_log_interval
+            ):
+                return
+
+            self.last_joint_state_log_time = float(self.data.time)
+            qpos_values = [
+                float(self.data.qpos[qpos_id]) for _, qpos_id, _ in self.joint_state_log_specs
+            ]
+            qvel_values = [
+                float(self.data.qvel[dof_id]) for _, _, dof_id in self.joint_state_log_specs
+            ]
+            self.joint_state_log_writer.writerow(
+                [float(self.data.time), time.time()] + qpos_values + qvel_values
+            )
+            self.joint_state_log_count += 1
+            if self.joint_state_log_count % 60 == 0:
+                self.joint_state_log_file.flush()
+
+
+    def close_joint_state_log(self):
+        if getattr(self, "joint_state_log_lock", None) is None:
+            return
+        self.stop_joint_state_recording()
 
 
     def setup_contact_patch_visualization(self):
@@ -429,11 +727,76 @@ class MujocoNode(Node):
             scene.ngeom += 1
 
 
+class JointStateRecordControl(QWidget):
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+        self.setWindowTitle("Joint State Recorder")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel()
+        self.path_label = QLabel()
+        self.path_label.setWordWrap(True)
+        self.toggle_button = QPushButton()
+        self.toggle_button.clicked.connect(self.toggle_recording)
+
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.path_label)
+        layout.addWidget(self.toggle_button)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(250)
+        self.refresh()
+
+    def toggle_recording(self):
+        self.node.toggle_joint_state_recording()
+        self.refresh()
+
+    def refresh(self):
+        recording = bool(getattr(self.node, "record_joint_state", False))
+        sample_count = int(getattr(self.node, "joint_state_log_count", 0))
+        joint_count = len(getattr(self.node, "joint_state_log_specs", []))
+        path = getattr(self.node, "joint_state_log_path", None)
+        self.status_label.setText(
+            f"状态: {'记录中' if recording else '未记录'} | "
+            f"关节数: {joint_count} | 样本数: {sample_count}"
+        )
+        self.path_label.setText(f"文件: {path if path is not None else '尚未创建'}")
+        self.toggle_button.setText("停止记录" if recording else "开始记录")
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        super().closeEvent(event)
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = MujocoNode()  # 创建 MujocoNode 实例
-    rclpy.spin(node) # 保持节点运行，检测是否收到退出指令（Ctrl+C）
-    rclpy.shutdown() # 关闭rclpy
+    use_control_gui = _to_bool(node.get_parameter("record_control_gui").value)
+
+    if use_control_gui:
+        spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+        spin_thread.start()
+        app = QApplication(sys.argv[:1])
+        window = JointStateRecordControl(node)
+        window.show()
+        try:
+            app.exec_()
+        finally:
+            node.close_joint_state_log()
+            rclpy.shutdown() # 关闭rclpy
+            spin_thread.join(timeout=1.0)
+            node.destroy_node()
+        return
+
+    try:
+        rclpy.spin(node) # 保持节点运行，检测是否收到退出指令（Ctrl+C）
+    finally:
+        node.close_joint_state_log()
+        node.destroy_node()
+        rclpy.shutdown() # 关闭rclpy
     
 
 

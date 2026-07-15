@@ -47,6 +47,7 @@ setup(
     entry_points={
         'console_scripts': [
             'linker_hand_mujoco_ros2_node=linker_hand_mujoco_ros2.nodes.mujoco_node:main',
+            'linker_hand_mujoco_ros2_dual_node=linker_hand_mujoco_ros2.nodes.mujoco_dual_node:main',
             'linker_hand_l20a_contact_node=linker_hand_mujoco_ros2.nodes.l20a_contact_node:main',
             'replay_l20a_contact_cmd=linker_hand_mujoco_ros2.nodes.replay_contact_cmd:main',
             'calculate_l20a_dynamics=linker_hand_mujoco_ros2.tools.calculate_l20a_dynamics:main',

@@ -30,6 +30,15 @@ $ source ./install/setup.bash
 $ ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2.launch.py
 ```
 
+# 2.1 **双手 MuJoCo 仿真**
+```bash
+$ colcon build --symlink-install
+$ source ./install/setup.bash
+$ ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2_dual.launch.py hand_joint:=L20
+```
+
+双手节点会在同一个 MuJoCo viewer 中加载左手和右手，并分别订阅 `/cb_left_hand_control_cmd` 和 `/cb_right_hand_control_cmd`。
+
 # 3. **topic说明**
 - /cb_right_hand_control_cmd or /cb_left_hand_control_cmd
 ```bash
