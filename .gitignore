@@ -40,8 +40,19 @@ Thumbs.db
 # Pickle data files (large, regeneratable)
 *.pkl
 
+# Generated numerical datasets and recordings
+*.npz
+*.mp4
+
+# Backup files
+*.bak
+
 # Contact patch output (generated data)
 contact_patch_output/
 
 # Logs
 *.log
+
+# MuJoCo diagnostic dumps
+MJDATA.TXT
+MJMODEL.TXT

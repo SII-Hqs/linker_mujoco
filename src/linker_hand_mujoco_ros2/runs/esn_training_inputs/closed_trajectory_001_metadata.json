@@ -1,0 +1,26 @@
+{
+  "npz": "C:\\Users\\wqf\\Desktop\\linker_mujoco\\src\\linker_hand_mujoco_ros2\\runs\\esn_training_inputs\\closed_trajectory_001.npz",
+  "warmup_csv": "C:\\Users\\wqf\\Desktop\\linker_mujoco\\src\\linker_hand_mujoco_ros2\\runs\\esn_training_inputs\\closed_trajectory_001_warmup.csv",
+  "training_csv": "C:\\Users\\wqf\\Desktop\\linker_mujoco\\src\\linker_hand_mujoco_ros2\\runs\\esn_training_inputs\\closed_trajectory_001_training.csv",
+  "feature_columns": [
+    "qpos_index_joint1",
+    "qpos_index_joint2",
+    "qpos_index_joint3",
+    "qvel_index_joint1",
+    "qvel_index_joint2",
+    "qvel_index_joint3",
+    "force_g"
+  ],
+  "warmup_samples": 5000,
+  "training_samples": 5001,
+  "simulation_timestep": 0.002,
+  "physics_sample_hz": 500.0,
+  "esn_fs_hz": 60.0,
+  "warmup_seconds": 10.0,
+  "record_seconds": 10.0,
+  "obstacle_removed": true,
+  "recurrence_k": 0.0,
+  "extreme_zero_n": 0,
+  "warmup_force_max_abs": 0.0,
+  "training_force_max_abs": 0.0
+}

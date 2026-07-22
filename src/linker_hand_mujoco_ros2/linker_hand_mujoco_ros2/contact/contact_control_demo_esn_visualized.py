@@ -212,7 +212,7 @@ def run_demo(args):
     """Run the ESN-control demo with MuJoCo viewer and reservoir heatmap."""
     simulation = build_esn_simulation(args)
     reservoir_view = ReservoirHeatmap(
-        simulation.controller.controller,
+        simulation.controller.active_controller,
         args.vis_fps,
         args.vis_backend,
     )

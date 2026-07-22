@@ -48,10 +48,10 @@ class MovingPlatformController:
 
         mujoco.mj_forward(model, data)
         target_pos = self._target_position()
-        platform_geom_id = self._first_geom_on_body(self.body_id)
+        self.platform_geom_id = self._first_geom_on_body(self.body_id)
         platform_half_z = 0.006
-        if platform_geom_id >= 0:
-            platform_half_z = float(model.geom_size[platform_geom_id, 2])
+        if self.platform_geom_id >= 0:
+            platform_half_z = float(model.geom_size[self.platform_geom_id, 2])
 
         if initial_pos is None:
             self.initial_pos = np.array(
@@ -69,6 +69,13 @@ class MovingPlatformController:
         self.period = max(float(period), 0.1)
         self._target_pos = None
         self._target_lock = threading.Lock()
+        self._removed = False
+        if self.platform_geom_id >= 0:
+            self._original_contype = int(model.geom_contype[self.platform_geom_id])
+            self._original_conaffinity = int(
+                model.geom_conaffinity[self.platform_geom_id]
+            )
+            self._original_rgba = model.geom_rgba[self.platform_geom_id].copy()
         self.data.mocap_quat[self.mocap_id] = np.array([1.0, 0.0, 0.0, 0.0])
         self.data.mocap_pos[self.mocap_id] = self.initial_pos
 
@@ -92,6 +99,27 @@ class MovingPlatformController:
             if self._target_pos is None:
                 return self.initial_pos.copy()
             return self._target_pos.copy()
+
+    def set_removed(self, removed):
+        """Hide the platform geom and disable its collisions until restored."""
+        removed = bool(removed)
+        if self.platform_geom_id < 0:
+            raise RuntimeError("moving platform has no geom to remove")
+        if removed:
+            self.model.geom_contype[self.platform_geom_id] = 0
+            self.model.geom_conaffinity[self.platform_geom_id] = 0
+            self.model.geom_rgba[self.platform_geom_id, 3] = 0.0
+        else:
+            self.model.geom_contype[self.platform_geom_id] = self._original_contype
+            self.model.geom_conaffinity[
+                self.platform_geom_id
+            ] = self._original_conaffinity
+            self.model.geom_rgba[self.platform_geom_id] = self._original_rgba
+        self._removed = removed
+
+    def is_removed(self):
+        """Return whether the platform is currently hidden and non-colliding."""
+        return self._removed
 
     def update(self, t):
         """Write the current automatic or external target into mocap_pos."""

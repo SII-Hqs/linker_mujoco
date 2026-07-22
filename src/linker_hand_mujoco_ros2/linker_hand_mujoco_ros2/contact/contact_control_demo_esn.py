@@ -273,6 +273,7 @@ def build_esn_simulation(args):
         torque_limit=args.torque_limit,
         torque_rate_limit=args.torque_rate_limit,
         filter_cutoff_hz=args.filter_cutoff_hz,
+        leak_alpha=getattr(args, "leak_alpha", None),
     )
     horizon_esn = HorizonESNTorqueController(
         model_path=args.horizon_esn_model,
@@ -399,6 +400,7 @@ def add_esn_arguments(parser):
     parser.add_argument("--force-clip", type=float, default=5.0)
     parser.add_argument("--force-scale", type=float, default=0.1)
     parser.add_argument("--damping", type=float, default=0.8)
+    parser.add_argument("--leak-alpha", type=float, default=None, metavar="ALPHA", help="Reservoir leaky-integrator alpha in [0, 1]. Default: model dt.")
     parser.add_argument(
         "--solref",
         type=float,
