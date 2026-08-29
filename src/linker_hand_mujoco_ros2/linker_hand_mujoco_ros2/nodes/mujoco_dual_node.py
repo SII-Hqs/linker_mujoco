@@ -287,7 +287,7 @@ class MujocoDualNode(Node):
         self.model.dof_damping[:] = 0.8
         self.data = mujoco.MjData(self.model)
         self.ctrl_values = np.zeros(self.model.nu, dtype=float)
-        self.model.opt.disableflags = 1
+        self.model.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
 
         self.left_hand = HandController("left", left_joint, self.model)
         self.right_hand = HandController("right", right_joint, self.model)

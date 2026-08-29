@@ -7,7 +7,7 @@ class MujocoSim:
         self.model = mujoco.MjModel.from_xml_path(str(model_xml))
         self.model.dof_damping[:] = 0.8
         self.data = mujoco.MjData(self.model)
-        self.model.opt.disableflags = 1
+        self.model.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
 
         self.finger_joint_names = finger_joint_names
         self.finger_frames = finger_frames

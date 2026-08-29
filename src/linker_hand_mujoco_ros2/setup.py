@@ -32,10 +32,19 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        ('share/' + package_name, ['package.xml', 'finger_l20_vec.pkl', 'L20A_CONTACT_NODE.md']),
+        ('share/' + package_name, [
+            path for path in [
+                'package.xml',
+                'finger_l20_vec.pkl',
+                'L20A_CONTACT_NODE.md',
+                'GRASP_EVALUATION.md',
+                'FUTURE_POSE_TORQUE_DEPLOYMENT.md',
+            ] if os.path.isfile(path)
+        ]),
     ]
     + install_tree(os.path.join(package_name, 'urdf'), 'urdf')
     + install_tree(os.path.join(package_name, 'resources'), 'resources')
+    + install_tree('deployment')
     + install_tree('retargeting_data'),
     install_requires=['setuptools'],
     zip_safe=True,
@@ -51,6 +60,8 @@ setup(
             'linker_hand_l20a_contact_node=linker_hand_mujoco_ros2.nodes.l20a_contact_node:main',
             'replay_l20a_contact_cmd=linker_hand_mujoco_ros2.nodes.replay_contact_cmd:main',
             'calculate_l20a_dynamics=linker_hand_mujoco_ros2.tools.calculate_l20a_dynamics:main',
+            'calculate_joint_log_torque=linker_hand_mujoco_ros2.tools.calculate_joint_log_torque:main',
+            'future_pose_torque_mujoco=linker_hand_mujoco_ros2.tools.future_pose_torque_mujoco:main',
         ],
     },
 )
