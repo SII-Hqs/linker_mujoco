@@ -83,4 +83,31 @@ source install/setup.bash
 ### o6还没开始调，在看重定向相关的资料
 ### 手套不包含手腕的自由度
 
+
+先完成 ESN torque + 手动按钮 + 0.2 N·m 限幅 的最小版本，验证无接触开合轨迹；然后加入方块接触；
+
+ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2.launch.py     hand_joint:=L20a     hand_type:=right     record_control_gui:=false     enable_grasp_evaluation:=true     grasp_object_control_range:=0.50
+
+  ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2.launch.py \
+    hand_joint:=L20a \
+    hand_type:=right \
+    record_control_gui:=false \
+    enable_grasp_evaluation:=true \
+    grasp_object_control_range:=0.50 \
+    enable_esn_controller:=true \
+    esn_model_variant:=combined
+
+  ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2.launch.py \
+    hand_joint:=L20a \
+    hand_type:=right \
+    record_control_gui:=false \
+    enable_grasp_evaluation:=true \
+    grasp_object_control_range:=0.50 \
+    enable_esn_controller:=true \
+    esn_model_variant:=separate
+
+
+    ros2 launch linker_hand_mujoco_ros2 linker_hand_mujoco_ros2.launch.py     hand_joint:=L20a     hand_type:=right     record_control_gui:=false     enable_grasp_evaluation:=true     grasp_object_control_range:=0.50     enable_esn_controller:=true     esn_model_variant:=combined
   
+
+
